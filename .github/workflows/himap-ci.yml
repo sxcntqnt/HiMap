@@ -83,10 +83,7 @@ jobs:
 
       - name: 🧊 DuckDB optimization check
         run: |
-          python -c "
-import duckdb
-print('DuckDB version:', duckdb.__version__)
-"
+          python -c "import duckdb ; print('DuckDB version:', duckdb.__version__)"
 
       - name: 📦 Dependency audit
         run: |
