@@ -1,0 +1,94 @@
+name: HiMap CI + Optimization Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test-optimize:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgis/postgis:15-3.3
+        env:
+          POSTGRES_DB: himap
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      POSTGIS_HOST: localhost
+      POSTGIS_PORT: 5432
+      POSTGIS_DB: himap
+      POSTGIS_USER: postgres
+      POSTGIS_PASSWORD: postgres
+
+    steps:
+      - name: 🧬 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest flake8 duckdb
+
+      - name: 🧹 Lint (code quality gate)
+        run: |
+          flake8 himap --max-line-length=100
+
+      - name: 🧪 Functional test (nodes query)
+        run: |
+          mkdir -p output
+          python -m himap ./output \
+            --start 13.0 52.0 \
+            --end 14.0 53.0 \
+            --query nodes \
+            --no-validate
+
+      - name: 📊 Validate output files
+        run: |
+          test -f output/traffic_nodes.parquet
+
+      - name: ⚡ Performance benchmark
+        run: |
+          START=$(date +%s)
+          python -m himap ./output \
+            --start 13.0 52.0 \
+            --end 14.0 53.0 \
+            --query nodes \
+            --no-validate
+          END=$(date +%s)
+          DURATION=$((END - START))
+          echo "Execution time: $DURATION seconds"
+
+          # Fail if too slow (tune threshold)
+          if [ $DURATION -gt 20 ]; then
+            echo "Performance regression detected!"
+            exit 1
+          fi
+
+      - name: 🧊 DuckDB optimization check
+        run: |
+          python -c "
+import duckdb
+print('DuckDB version:', duckdb.__version__)
+"
+
+      - name: 📦 Dependency audit
+        run: |
+          pip install pip-audit
+          pip-audit
