@@ -607,43 +607,43 @@ async def list_backends():
         "note": "DuckDB is the default backend. PostGIS is maintained for backward compatibility only."
     }
 
-@app.get("/tiles/{z}/{x}/{y}.parquet")
-async def get_tile(
+@app.get("/partitions/{z}/{x}/{y}.parquet")
+async def get_partition(
     z: int,
     x: int,
     y: int,
     city: str = Query("nairobi", description="City identifier"),
     country: str = Query("KE", description="Country code")
 ):
-    """Get a specific tile by z/x/y coordinates (Three-Layer: Quadtree)"""
+    """Get a spatially-partitioned Parquet file by z/x/y coordinates (Three-Layer: Quadtree)"""
     try:
         from fastapi.responses import FileResponse
         from pathlib import Path
         
-        # Construct tile path
-        tile_path = Path(f"./tiles/{country.lower()}/{city.lower()}/z{z}/{x}/{y}.parquet")
+        # Construct partition path
+        partition_path = Path(f"./partitions/{country.lower()}/{city.lower()}/z{z}/{x}/{y}.parquet")
         
-        if not tile_path.exists():
-            raise HTTPException(status_code=404, detail=f"Tile not found: z={z}, x={x}, y={y}")
+        if not partition_path.exists():
+            raise HTTPException(status_code=404, detail=f"Partition not found: z={z}, x={x}, y={y}")
         
         return FileResponse(
-            path=str(tile_path),
+            path=str(partition_path),
             media_type="application/octet-stream",
             headers={
-                "X-Tile-Z": str(z),
-                "X-Tile-X": str(x),
-                "X-Tile-Y": str(y),
+                "X-Partition-Z": str(z),
+                "X-Partition-X": str(x),
+                "X-Partition-Y": str(y),
                 "Cache-Control": "public, max-age=3600"
             }
         )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching tile: {e}")
+        logger.error(f"Error fetching partition: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/tiles/{z}/{x}/{y}/data")
-async def get_tile_data(
+@app.get("/partitions/{z}/{x}/{y}/data")
+async def get_partition_data(
     z: int,
     x: int,
     y: int,
@@ -652,30 +652,30 @@ async def get_tile_data(
     format: str = Query("geojson", description="Output format: geojson or raw")
 ):
     """
-    Get tile data as GeoJSON or raw Parquet bytes.
+    Get partitioned data as GeoJSON or raw Parquet bytes.
     Three-Layer: Quadtree (z/x/y) + H3 (pre-filter) + Z-order (sorted)
     """
     try:
         import duckdb
         from shapely import wkb
         
-        tile_path = Path(f"./tiles/{country.lower()}/{city.lower()}/z{z}/{x}/{y}.parquet")
+        partition_path = Path(f"./partitions/{country.lower()}/{city.lower()}/z{z}/{x}/{y}.parquet")
         
-        if not tile_path.exists():
-            raise HTTPException(status_code=404, detail=f"Tile not found")
+        if not partition_path.exists():
+            raise HTTPException(status_code=404, detail=f"Partition not found")
         
         if format == "raw":
             # Return raw Parquet bytes
-            with open(tile_path, 'rb') as f:
+            with open(partition_path, 'rb') as f:
                 data = f.read()
             return Response(content=data, media_type="application/octet-stream")
         
-        # Read tile with DuckDB and convert to GeoJSON
+        # Read partition with DuckDB and convert to GeoJSON
         conn = duckdb.connect(":memory:")
         conn.execute("INSTALL spatial; LOAD spatial")
         
         result = conn.execute(f"""
-            SELECT 
+            SELECT
                 osm_id,
                 feature_type,
                 name,
@@ -685,7 +685,7 @@ async def get_tile_data(
                 highway,
                 building,
                 amenity
-            FROM read_parquet('{tile_path}')
+            FROM read_parquet('{partition_path}')
             LIMIT 10000
         """).fetchall()
         
@@ -720,17 +720,17 @@ async def get_tile_data(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error reading tile data: {e}")
+        logger.error(f"Error reading partition data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/tiles/manifest")
+@app.get("/partitions/manifest")
 async def get_manifest(
     city: str = Query("nairobi", description="City identifier"),
     country: str = Query("KE", description="Country code")
 ):
-    """Get tile manifest for a city (Three-Layer: Metadata)"""
+    """Get partition manifest for a city (Three-Layer: Metadata)"""
     try:
-        manifest_path = Path(f"./tiles/{country.lower()}/{city.lower()}/manifest.json")
+        manifest_path = Path(f"./partitions/{country.lower()}/{city.lower()}/manifest.json")
         
         if not manifest_path.exists():
             raise HTTPException(status_code=404, detail=f"Manifest not found for {city}")

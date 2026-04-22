@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Partition OSM data into tiles for CDN distribution.
+Partition OSM data into spatially-organized Parquet files.
 Runs the three-layer partitioning pipeline:
-- Layer 1: Quadtree tiles (z/x/y)
+- Layer 1: Quadtree partitions (z/x/y)
 - Layer 2: H3 indices (resolutions 7-10)
 - Layer 3: Z-order keys (Morton encoding)
 
+Note: This creates spatially-partitioned Parquet files for analytical queries,
+NOT map tiles. The z/x/y addressing organizes data geographically.
+
 Usage:
     python partition_data.py --db-path ./data/osm.duckdb --city nairobi --country KE
-    python partition_data.py --db-path ./data/osm.duckdb --city mombasa --country KE --tables osm_raw,osm_pois
+    python partition_data.py --db-path ./data/osm.duckdb --city mombasa --country KE --tables osm_raw
 """
 
 import argparse
@@ -19,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from himap.Export.TilePartitioner import TilePartitioner
+from himap.Export.Partitioner import Partitioner
 
 logging.basicConfig(
     level=logging.INFO,

@@ -6,7 +6,8 @@ HiMap is now a FastAPI-based HTTP server that provides programmatic access to sp
 
 - **RESTful API** for querying spatial data (traffic nodes, corridors, vehicles, H3 cells)
 - **Three-Layer Partitioning System**: Quadtree (WHERE) + H3 (WHAT) + Z-order (HOW) for optimized data organization
-- **Tile Serving**: Direct access to partitioned Parquet tiles via z/x/y coordinates
+- **Partitioned Parquet Export**: Export spatially-partitioned Parquet files via z/x/y addressing
+- **Streaming Parquet Writer**: Memory-efficient chunked export using `ParquetStreamWriter`
 - **Database Backends**: DuckDB (default, optimized for analytical workloads) with PostGIS compatibility layer (deprecated)
 - **Parquet Export**: Download query results as optimized Parquet files
 - **GeoJSON Support**: Optional GeoJSON output for map visualization
@@ -20,9 +21,11 @@ HiMap is now a FastAPI-based HTTP server that provides programmatic access to sp
 
 | Layer | Question Answered | Implementation |
 |-------|------------------|----------------|
-| **Layer 1: Quadtree** | WHERE does data live? | Tile addressing (z/x/y) for CDN distribution |
+| **Layer 1: Quadtree** | WHERE does data live? | Spatial partitioning (z/x/y) for file organization |
 | **Layer 2: H3** | WHAT does data mean? | H3 hierarchical spatial index (resolutions 7-10) |
 | **Layer 3: Z-order** | HOW is data stored? | Morton encoding for sequential disk reads |
+
+**Note**: The three-layer system creates **spatially-partitioned Parquet files** optimized for analytical queries, not map tiles. The z/x/y addressing organizes data geographically while maintaining efficient query patterns.
 
 ## 📊 Default Configuration
 
@@ -116,6 +119,8 @@ curl http://localhost:8000/health
 
 ## 📦 API Endpoints
 
+### Data Query Endpoints
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/` | API information and available endpoints |
@@ -124,7 +129,21 @@ curl http://localhost:8000/health
 | GET | `/query/corridors` | Corridor analytics within bounding box |
 | GET | `/query/vehicles` | Vehicle tracking data |
 | GET | `/query/h3` | H3 grid cells |
+| GET | `/query/h3-cells` | Query features by H3 cell |
 | GET | `/query/all` | All data types in single request |
+
+### Partitioned Data Endpoints (Three-Layer)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/partitions/{z}/{x}/{y}.parquet` | Spatially-partitioned Parquet file (Layer 1: Quadtree) |
+| GET | `/partitions/{z}/{x}/{y}/data` | Partition data as GeoJSON or raw bytes |
+| GET | `/partitions/manifest` | Manifest for partitioned data files |
+
+### Export & Management Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | GET | `/export/{data_type}` | Export data as Parquet file |
 | POST | `/set-backend` | Switch database backend |
 | GET | `/backends` | List available backends |
@@ -161,6 +180,8 @@ curl http://localhost:8000/health
 - `himap/Services/DuckDBService.py`: Primary database service (default)
 - `himap/Services/PostGISService.py`: Compatibility layer (deprecated)
 - `himap/Export/ParquetExporter.py`: Optimized Parquet export functionality
+- `himap/Export/Partitioner.py`: Three-layer spatial partitioning with ParquetStreamWriter integration
+- `himap/Export/Writer/parquet_stream_writer/`: Memory-efficient chunked Parquet writer
 
 ### Running Tests
 ```bash
