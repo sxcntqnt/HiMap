@@ -1,26 +1,26 @@
 # HiMap PostGIS Migration Requirements
 # Core dependencies
-certifi==2024.2.2
-charset-normalizer==3.3.2
-idna==3.7
-urllib3==2.2.1
+certifi==2026.4.22
+charset-normalizer==3.4.7
+idna==3.13
+urllib3==2.6.3
 
 # Database connectivity
-psycopg2-binary==2.9.9
-duckdb==1.0.0  # For future migration from PostGIS
+psycopg2-binary==2.9.12
+duckdb==1.5.2  # For future migration from PostGIS
 
 # Spatial data processing
-shapely==2.0.4
+shapely==2.1.2
 
 # Parquet handling
-pyarrow==15.0.2
-pandas==2.2.2
+pyarrow==24.0.0
+pandas==3.0.2
 
 # Optional: for progress bars (kept from original)
-tqdm==4.66.2
+tqdm==4.67.3
 
 # Colorama for Windows compatibility
 colorama==0.4.6
 
 # Geographiclib for distance calculations (kept from original)
-geographiclib==2.0
+geographiclib==2.1
