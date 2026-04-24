@@ -1,231 +1,190 @@
-# HiMap Spatial Data HTTP Server
+# HiMap v2.0 - DuckLake Spatial Data API
 
-HiMap is now a FastAPI-based HTTP server that provides programmatic access to spatial data from PostGIS or DuckDB databases, with the ability to export results as Parquet files. The server has been migrated from the original Google Maps Static API-based image generator to a modern spatial data service.
+HiMap is a FastAPI-based HTTP server providing unified access to spatial data through DuckLake - a hybrid architecture using DuckDB as the analytical engine with optional PostGIS catalog integration for metadata and transactional queries.
 
-## 🚀 Features
+## Features
 
 - **RESTful API** for querying spatial data (traffic nodes, corridors, vehicles, H3 cells)
-- **Three-Layer Partitioning System**: Quadtree (WHERE) + H3 (WHAT) + Z-order (HOW) for optimized data organization
-- **Partitioned Parquet Export**: Export spatially-partitioned Parquet files via z/x/y addressing
-- **Streaming Parquet Writer**: Memory-efficient chunked export using `ParquetStreamWriter`
-- **Database Backends**: DuckDB (default, optimized for analytical workloads) with PostGIS compatibility layer (deprecated)
-- **Parquet Export**: Download query results as optimized Parquet files
+- **DuckLake Architecture**: DuckDB engine + optional PostGIS catalog for unified data access
+- **Partitioned Parquet Export**: Spatially-partitioned data files via z/x/y addressing
+- **Streaming Parquet Writer**: Memory-efficient chunked export using `ParquetStreamWriter` for large datasets
+- **Three-Layer Spatial Partitioning**: Quadtree (WHERE) + H3 (WHAT) + Z-order (HOW) for optimized organization
 - **GeoJSON Support**: Optional GeoJSON output for map visualization
-- **Spatial Queries**: Bounding box, point-in-polygon, proximity searches, H3 cell-based queries
-- **Automatic Documentation**: Interactive API docs via Swagger UI
-- **Health Monitoring**: Database connectivity and performance metrics
-- **Resource Management**: Per-query connection limits to prevent resource exhaustion
-- **Input Validation**: Comprehensive query parameter validation and sanitization
+- **Automatic Documentation**: Interactive API docs via Swagger UI at `/docs`
 
-### Three-Layer Architecture
+## Architecture
 
-| Layer | Question Answered | Implementation |
-|-------|------------------|----------------|
-| **Layer 1: Quadtree** | WHERE does data live? | Spatial partitioning (z/x/y) for file organization |
-| **Layer 2: H3** | WHAT does data mean? | H3 hierarchical spatial index (resolutions 7-10) |
-| **Layer 3: Z-order** | HOW is data stored? | Morton encoding for sequential disk reads |
+**DuckLake** combines the best of both worlds:
+- **DuckDB**: Columnar analytical engine for fast spatial queries
+- **PostGIS Catalog**: Optional external catalog for metadata, snapshots, and transactional queries (not legacy access)
+- **Three-Layer Partitioning**: Spatial data organization (Quadtree/H3/Z-order)
+- **Unified API**: Single interface regardless of data source
 
-**Note**: The three-layer system creates **spatially-partitioned Parquet files** optimized for analytical queries, not map tiles. The z/x/y addressing organizes data geographically while maintaining efficient query patterns.
-
-## 📊 Default Configuration
-
-- **Database**: DuckDB (in-memory by default, configurable for persistence)
-- **Port**: 8000
-- **Host**: 0.0.0.0 (accessible from any interface)
-
-## 🔧 Installation
+## Quick Start
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd HiMap
-
-# Create virtual environment
-python -m venv .venv
-
-# Activate virtual environment
-# Windows:
-.venv/Scripts/activate
-# Unix/MacOS:
-source .venv/bin/activate
-
 # Install dependencies
 pip install -r requirements.txt
-```
 
-## ▶️ Usage
-
-### Start the Server
-```bash
+# Start the server
 python run_server.py
+
+# Access API documentation
+open http://localhost:8000/docs
 ```
 
-The server will be available at http://localhost:8000
+## API Endpoints
 
-### API Documentation
-Visit http://localhost:8000/docs for interactive Swagger UI documentation
+### Core Query Endpoints
 
-### Example Queries
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | API information |
+| `/health` | GET | Health check with catalog status |
+| `/catalogs` | GET | List available catalog sources |
+| `/query/nodes` | GET | Traffic nodes within bounds |
+| `/query/corridors` | GET | Corridor analytics |
+| `/query/vehicles` | GET | Vehicle tracking |
+| `/query/h3` | GET | H3 grid cells |
+| `/query/all` | GET | All data types |
 
-#### Get Traffic Nodes
+### Partitioned Data Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/partitions/{z}/{x}/{y}.parquet` | GET | Spatially-partitioned Parquet file |
+| `/partitions/{z}/{x}/{y}/data` | GET | Partition data as GeoJSON/raw |
+| `/partitions/manifest` | GET | Partition manifest for a city |
+
+### Configuration & Export
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/set-catalog` | POST | Configure catalog (postgis/duckdb) |
+| `/export/{data_type}` | GET | Export data as Parquet |
+
+## Streaming Parquet Export
+
+HiMap includes `ParquetStreamWriter` for memory-efficient export of large datasets:
+
+### Features
+
+- **Streaming Architecture**: Processes data in configurable chunks without loading entire dataset into memory
+- **Automatic Buffering**: Buffers records in memory and flushes to disk when threshold reached
+- **File Sharding**: Automatically creates new Parquet files when size limit reached
+- **Compression**: ZSTD compression with configurable levels
+- **Progress Tracking**: Logs export progress for monitoring
+
+### Usage
+
+```python
+from himap.Export.Writer.parquet_stream_writer.src.parquet_stream_writer import ParquetStreamWriter
+
+# Streaming export for large datasets
+partitioner = Partitioner(db_path="./data/osm.duckdb")
+manifest = partitioner.export_partitions_streaming(
+    partition_table="osm_raw_partitioned",
+    city_id="nairobi",
+    country_code="KE",
+    shard_size_bytes=512_000_000,  # 512MB per shard
+    buffer_size_bytes=16_777_216,   # 16MB buffer
+    row_group_size=10000
+)
+```
+
+### CLI Partitioning
+
 ```bash
-curl "http://localhost:8000/query/nodes?south_west_lng=13.0&south_west_lat=52.0&north_east_lng=14.0&north_east_lat=53.0"
+# Standard export using DuckDB COPY
+python partition_data.py \
+    --db-path ./data/osm.duckdb \
+    --city nairobi \
+    --country KE \
+    --output ./partitions
+
+# The Partitioner automatically uses ParquetStreamWriter
+# for memory-efficient chunked writing
 ```
 
-#### Get Vehicles with Filtering
+## Configuration
+
+### DuckLake Catalog Options
+
+**Option 1: Native DuckDB (default)**
 ```bash
-curl "http://localhost:8000/query/vehicles?south_west_lng=13.0&south_west_lat=52.0&north_east_lng=14.0&north_east_lat=53.0&status=active&limit=100"
+curl -X POST "http://localhost:8000/set-catalog?catalog=duckdb"
 ```
 
-#### Export Data as Parquet
+**Option 2: PostGIS Catalog**
 ```bash
-curl -o nodes.parquet "http://localhost:8000/export/nodes?south_west_lng=13.0&south_west_lat=52.0&north_east_lng=14.0&north_east_lat=53.0"
+curl -X POST "http://localhost:8000/set-catalog" \
+  -G \
+  -d "catalog=postgis" \
+  -d "host=localhost" \
+  -d "port=5432" \
+  -d "database=himap" \
+  -d "user=postgres" \
+  -d "password=secret"
 ```
 
-#### Switch Database Backend
+## Three-Layer Spatial Partitioning
+
+HiMap organizes spatial data using a three-layer contract:
+
+| Layer | Purpose | Implementation |
+|-------|---------|----------------|
+| **Quadtree** | WHERE data lives | z/x/y spatial addressing |
+| **H3** | WHAT data means | Hierarchical spatial index (res 7-10) |
+| **Z-order** | HOW data is stored | Morton encoding for sequential I/O |
+
+### Partitioning Data
+
 ```bash
-# To DuckDB (default)
-curl -X POST "http://localhost:8000/set-backend?backend=duckdb"
-
-# To PostGIS (deprecated compatibility layer)
-curl -X POST "http://localhost:8000/set-backend?backend=postgis"
+python partition_data.py \
+    --db-path ./data/osm.duckdb \
+    --city nairobi \
+    --country KE \
+    --output ./partitions
 ```
 
-#### Health Check
-```bash
-curl http://localhost:8000/health
-```
-
-## 🗃️ Database Configuration
-
-### DuckDB (Default)
-- Uses in-memory database by default for fastest performance (data lost on restart)
-- Can be configured for persistent storage via environment variables:
-  - `DUCKDB_PATH`: Path to DuckDB file (default: ":memory:" for in-memory)
-- Each query uses a dedicated read-only connection with resource limits:
-  - Memory limit: 2GB per query (configurable via DuckDBService)
-  - Thread limit: 4 threads per query (configurable via DuckDBService)
-- Designed for read-heavy analytical workloads; write operations should be handled externally
-
-### PostGIS (Deprecated - Compatibility Layer)
-- Still supported for backward compatibility but **not recommended for new deployments**
-- Configure via environment variables:
-  - `POSTGIS_HOST` (default: localhost)
-  - `POSTGIS_PORT` (default: 5432)
-  - `POSTGIS_DB` (default: himap)
-  - `POSTGIS_USER` (default: postgres)
-  - `POSTGIS_PASSWORD` (default: empty)
-- Note: DuckDB's spatial extension covers most common spatial predicates (ST_Intersects, ST_DWithin, ST_AsWKB, ST_AsGeoJSON, etc.) but lacks advanced PostGIS features like topology, raster, and advanced buffer styling. For users with existing PostGIS workloads, evaluate DuckDB support for your specific use cases before migrating.
-
-## 📦 API Endpoints
-
-### Data Query Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/` | API information and available endpoints |
-| GET | `/health` | Health check with database status |
-| GET | `/query/nodes` | Traffic nodes within bounding box |
-| GET | `/query/corridors` | Corridor analytics within bounding box |
-| GET | `/query/vehicles` | Vehicle tracking data |
-| GET | `/query/h3` | H3 grid cells |
-| GET | `/query/h3-cells` | Query features by H3 cell |
-| GET | `/query/all` | All data types in single request |
-
-### Partitioned Data Endpoints (Three-Layer)
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/partitions/{z}/{x}/{y}.parquet` | Spatially-partitioned Parquet file (Layer 1: Quadtree) |
-| GET | `/partitions/{z}/{x}/{y}/data` | Partition data as GeoJSON or raw bytes |
-| GET | `/partitions/manifest` | Manifest for partitioned data files |
-
-### Export & Management Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/export/{data_type}` | Export data as Parquet file |
-| POST | `/set-backend` | Switch database backend |
-| GET | `/backends` | List available backends |
-
-## 📄 Data Formats
-
-### Parquet Export
-- Optimized columnar format for analytical workloads
-- SNAPPY compression for efficient storage
-- Includes statistics for query optimization
-- Schema preserved for downstream consumption
-
-### GeoJSON Output
-- Standard GeoJSON FeatureCollection format
-- Compatible with mapping libraries (Leaflet, Mapbox GL JS, etc.)
-- Available via query parameters on most endpoints
-
-## ⚙️ Environment Variables
+## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DUCKDB_PATH` | DuckDB file path | `:memory:` (in-memory) |
-| `POSTGIS_HOST` | PostGIS server host | `localhost` |
+| `DUCKDB_PATH` | DuckDB database path | `:memory:` |
+| `POSTGIS_HOST` | PostGIS server host | - |
 | `POSTGIS_PORT` | PostGIS server port | `5432` |
-| `POSTGIS_DB` | PostGIS database name | `himap` |
-| `POSTGIS_USER` | PostGIS username | `postgres` |
-| `POSTGIS_PASSWORD` | PostGIS password | `` (empty) |
-| `HOST` | Server host | `0.0.0.0` |
-| `PORT` | Server port | `8000` |
+| `POSTGIS_DB` | PostGIS database name | - |
+| `POSTGIS_USER` | PostGIS username | - |
+| `POSTGIS_PASSWORD` | PostGIS password | - |
+| `HOST` | API server host | `0.0.0.0` |
+| `PORT` | API server port | `8000` |
 
-## 🛠️ Development
+## Project Structure
 
-### Backend Services
-- `himap/Services/DuckDBService.py`: Primary database service (default)
-- `himap/Services/PostGISService.py`: Compatibility layer (deprecated)
-- `himap/Export/ParquetExporter.py`: Optimized Parquet export functionality
-- `himap/Export/Partitioner.py`: Three-layer spatial partitioning with ParquetStreamWriter integration
-- `himap/Export/Writer/parquet_stream_writer/`: Memory-efficient chunked Parquet writer
-
-### Running Tests
-```bash
-# Run basic functionality tests
-python -m pytest tests/ -v
+```
+himap/
+├── API/
+│   └── main.py              # FastAPI HTTP endpoints
+├── Services/
+│   └── DuckLakeService.py   # Unified DuckDB+PostGIS service
+├── Export/
+│   ├── Partitioner.py       # Three-layer spatial partitioning
+│   ├── ParquetExporter.py   # Parquet export utilities
+│   └── Writer/              # Streaming Parquet writer
+├── requirements.txt         # Dependencies
+└── run_server.py           # Server startup script
 ```
 
-## 📝 Notes
+## Migration from v1.x
 
-### Performance
-- DuckDB provides excellent performance for analytical workloads (vectorized execution, columnar storage)
-- In-memory database offers sub-second response times for most queries
-- Parquet export is optimized for large result sets
-- Each query runs with resource limits to ensure fair sharing under concurrent load
-- For extremely large datasets (>100M rows), consider persistent DuckDB storage and tuning memory limits
+HiMap v2.0 replaces the dual-service architecture (DuckDBService + PostGISService) with a unified DuckLake service:
 
-### Migration Path
-1. **Current**: DuckDB is default, PostGIS available for compatibility (evaluate your spatial function needs)
-2. **Future**: PostGIS service will be removed in favor of native DuckDB
-3. **Data Migration**: Tools available to migrate from PostGIS to DuckDB (e.g., using `ogr2ogr` or DuckDB's PostgreSQL scanner)
+- **Before**: Switch between `duckdb` and `postgis` backends
+- **After**: Use DuckLake with optional PostGIS catalog attachment
 
-### Limitations
-- Designed for read-heavy analytical workloads
-- Write operations should be handled through external ETL processes
-- Very large datasets may require adjusting memory/thread limits in DuckDBService
-- Assumes WGS84 (EPSG:4326) for all input and output coordinates; for accurate distance/area calculations, clients should reproject to an appropriate CRS (e.g., Africa Albers Equal Area ESRI:102022) in their application layer
-- Authentication and rate limiting are not included; these should be implemented at the deployment level (reverse proxy, API gateway, or middleware) as needed for your security requirements
+The API remains backward-compatible for query endpoints.
 
-### Security Considerations
-- All query parameters are validated for type, range, and format
-- Result sets are capped per endpoint to prevent accidental large responses:
-  - Nodes: 500 (configurable via endpoint limit parameter)
-  - Corridors: 200
-  - Vehicles: 1000
-  - H3 cells: 5000
-  - All data types: individual limits per type
-- Geometry complexity is indirectly limited by memory and thread constraints per query
-- Temporary export files are cleaned up automatically (files older than 1 hour)
-- For production deployments, consider adding authentication, rate limiting, and input sanitization at the infrastructure level
+## License
 
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## ⚠️ Disclaimer
-
-This software is provided for educational and analytical purposes. Ensure compliance with data usage policies and regulations when working with spatial data.
+MIT License - See LICENSE file for details.

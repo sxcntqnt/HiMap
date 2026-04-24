@@ -1,13 +1,14 @@
 """
 Spatial Partitioning Service for Analytical Parquet Export
 
+Works with DuckLake architecture (DuckDB + optional PostGIS catalog).
+
 Implements the three-layer contract:
 - Layer 1 (Quadtree): WHERE data lives (spatial partitioning z/x/y)
 - Layer 2 (H3): WHAT data means (semantic clustering)
 - Layer 3 (Z-order): HOW data is stored (sequential I/O)
 
-Creates spatially-partitioned Parquet files for analytical queries, NOT map tiles.
-The z/x/y addressing organizes data geographically for efficient query patterns.
+Creates spatially-partitioned Parquet files for analytical queries.
 
 For Africa-wide datasets, optimized for Kenya/Nairobi as reference implementation.
 """
@@ -27,6 +28,9 @@ from shapely import wkb
 # Import the parquet stream writer for efficient chunked writing
 from .Writer.parquet_stream_writer.src.parquet_stream_writer import ParquetStreamWriter
 
+# Import DuckLake service
+from ..Services.DuckLakeService import DuckLakeService
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,23 +38,24 @@ class Partitioner:
     """
     Three-layer spatial partitioning for analytical Parquet export.
     
+    Works with DuckLake (DuckDB + optional PostGIS catalog) to partition
+    spatial data from any source into optimized Parquet files.
+    
     Responsibilities:
     - Assign features to quadtree spatial partitions (z/x/y)
     - Compute H3 indices at multiple resolutions
     - Generate z-order keys for sequential reads
     - Export spatially-partitioned Parquet files for analytical queries
-    
-    Note: This creates spatially-partitioned data files, NOT map tiles.
-    The z/x/y addressing organizes data geographically for efficient queries.
     """
-    
+
     def __init__(
         self,
         db_path: str = ":memory:",
         output_dir: str = "./partitions",
         partition_zoom: int = 10,
         target_features_per_partition: int = 50000,
-        h3_resolutions: List[int] = None
+        h3_resolutions: List[int] = None,
+        postgis_catalog: Optional[Dict[str, str]] = None
     ):
         """
         Initialize spatial partitioner with configuration.
@@ -61,23 +66,31 @@ class Partitioner:
             partition_zoom: Quadtree zoom level for leaf partitions (default 10)
             target_features_per_partition: Maximum features per partition before subdivision
             h3_resolutions: List of H3 resolutions to compute (default [7, 8, 9, 10])
+            postgis_catalog: Optional PostGIS catalog connection config
         """
         self.db_path = db_path
         self.output_dir = Path(output_dir)
         self.partition_zoom = partition_zoom
         self.target_features_per_partition = target_features_per_partition
         self.h3_resolutions = h3_resolutions or [7, 8, 9, 10]
+        self.postgis_catalog = postgis_catalog
+        
+        # Initialize DuckLake service
+        self.ducklake = DuckLakeService(
+            db_path=db_path,
+            postgis_catalog=postgis_catalog
+        )
         
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"Partitioner initialized: zoom={partition_zoom}, "
-                   f"target={target_features_per_partition} features/partition")
-    
+                   f"target={target_features_per_partition} features/partition, "
+                   f"catalog={'postgis' if postgis_catalog else 'duckdb'}")
+
     def _get_connection(self):
-        """Get DuckDB connection with extensions loaded"""
-        conn = duckdb.connect(self.db_path, read_only=True)
-        conn.execute("INSTALL spatial")
+        """Get DuckDB connection from DuckLake service"""
+        return self.ducklake._get_connection()
         conn.execute("LOAD spatial")
         conn.execute("INSTALL h3")
         conn.execute("LOAD h3")

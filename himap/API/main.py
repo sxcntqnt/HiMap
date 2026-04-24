@@ -1,17 +1,52 @@
+"""
+HiMap v2.0 - DuckLake Spatial Data API
+FastAPI-based HTTP server with Pydantic validation and DuckLake integration.
+
+DuckLake = DuckDB (analytical engine) + Optional PostGIS catalog
+"""
+
 import logging
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
-import uvicorn
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from pathlib import Path
 import json
-import os
 from datetime import datetime
 
 # Import our services
-from ..Services.DuckDBService import duckdb_service
-from ..Services.PostGISService import postgis_service  # Kept for backward compatibility
-from ..Export.ParquetExporter import parquet_exporter
+from ..Services.DuckLakeService import DuckLakeService, ducklake_service
+
+# Import Pydantic models
+from ..Models.requests import (
+    NodeQueryParams,
+    VehicleQueryParams,
+    CorridorQueryParams,
+    H3QueryParams,
+    H3CellQueryParams,
+    AllDataQueryParams,
+    ExportParams,
+    PartitionExportParams,
+    CatalogConfig,
+)
+from ..Models.responses import (
+    NodesResponse,
+    VehiclesResponse,
+    CorridorsResponse,
+    H3CellsResponse,
+    H3CellQueryResponse,
+    AllDataResponse,
+    HealthStatus,
+    CatalogsResponse,
+    CatalogInfo,
+    ErrorResponse,
+    ErrorDetail,
+    PartitionManifest,
+    CatalogSetResponse,
+    APIRootResponse,
+)
+from ..Models.config import PostGISCatalogConfig, DuckLakeConfig
 
 # Setup logging
 logging.basicConfig(
@@ -20,361 +55,261 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app
+# Create FastAPI app with enhanced metadata
 app = FastAPI(
     title="HiMap Spatial Data API",
-    description="HTTP API for querying spatial data from PostGIS/DuckDB and exporting as Parquet",
-    version="1.0.0"
+    description="HTTP API for querying spatial data from DuckLake (DuckDB + optional PostGIS catalog)",
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
-# Global variable to track selected database service
-current_db_service = duckdb_service  # Default to DuckDB (PostGIS deprecated)
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def get_db_service():
+# Global variable - now using unified DuckLake service
+current_db_service = ducklake_service
+
+def get_db_service() -> DuckLakeService:
     """Get the current database service"""
     return current_db_service
 
+
+# Exception Handlers with Full Context
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle validation errors with field-level details."""
+    errors = []
+    for error in exc.errors():
+        errors.append(ErrorDetail(
+            loc=list(error.get("loc", [])),
+            msg=error.get("msg", "Unknown validation error"),
+            type=error.get("type", "validation_error")
+        ))
+    
+    # Build helpful message
+    field_errors = [f"{'.'.join(e.loc)}: {e.msg}" for e in errors if e.loc]
+    message = "Validation failed"
+    if field_errors:
+        message = f"Validation failed: {'; '.join(field_errors[:3])}"
+    
+    response = ErrorResponse(
+        status="error",
+        code="VALIDATION_ERROR",
+        message=message,
+        details=errors
+    )
+    return JSONResponse(status_code=422, content=response.dict())
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP errors with context."""
+    response = ErrorResponse(
+        status="error",
+        code=f"HTTP_{exc.status_code}",
+        message=exc.detail,
+        details=None
+    )
+    return JSONResponse(status_code=exc.status_code, content=response.dict())
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle unexpected errors with request context."""
+    logger.error(f"Unhandled exception in {request.method} {request.url.path}: {exc}", exc_info=True)
+    
+    response = ErrorResponse(
+        status="error",
+        code="INTERNAL_ERROR",
+        message=f"Internal server error: {str(exc)[:100]}",
+        details=[ErrorDetail(loc=["server"], msg=str(exc), type=type(exc).__name__)]
+    )
+    return JSONResponse(status_code=500, content=response.dict())
+
+
+# Startup/Shutdown Events
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize services on startup"""
-    logger.info("HiMap Spatial Data API starting up with DuckDB as default backend (PostGIS deprecated)...")
-    # Test database connection
+    """Initialize DuckLake service on startup."""
+    logger.info("=" * 60)
+    logger.info("HiMap v2.0 - DuckLake Spatial Data API Starting")
+    logger.info("Architecture: DuckDB engine + Optional PostGIS catalog")
+    logger.info("=" * 60)
+    
     try:
         db_service = get_db_service()
-        if hasattr(db_service, 'health_check'):
-            health = db_service.health_check()
-            if not health['healthy']:
-                logger.warning(f"Database health check failed: {health}")
-            else:
-                logger.info(f"Database connected successfully: {health}")
+        health = db_service.health_check()
+        
+        if health['healthy']:
+            logger.info(f"DuckLake initialized: {health}")
+            
+            # List available tables
+            try:
+                tables = db_service.list_catalog_tables()
+                logger.info(f"Available tables: {len(tables)}")
+                for table in tables[:10]:
+                    logger.info(f"  - {table['name']} ({table['source']})")
+            except Exception as e:
+                logger.warning(f"Could not list tables: {e}")
         else:
-            logger.info("Database service initialized")
+            logger.warning(f"DuckLake health check failed: {health}")
     except Exception as e:
-        logger.error(f"Failed to initialize database connection: {e}")
+        logger.error(f"Failed to initialize DuckLake: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
+    """Cleanup on shutdown."""
     logger.info("HiMap Spatial Data API shutting down...")
-    # Close database connections if needed
-    try:
-        if hasattr(postgis_service, 'pool') and postgis_service.pool:
-            postgis_service.pool.closeall()
-    except Exception as e:
-        logger.error(f"Error closing PostGIS connections: {e}")
 
-@app.get("/")
+
+# API Endpoints
+
+@app.get(
+    "/",
+    response_model=APIRootResponse,
+    tags=["info"],
+    summary="API information",
+)
 async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "HiMap Spatial Data API",
-        "version": "1.0.0",
-        "description": "Query spatial data and export as Parquet files",
-        "endpoints": {
+    """Get API information and available endpoints."""
+    return APIRootResponse(
+        message="HiMap Spatial Data API",
+        version="2.0.0",
+        description="Query spatial data from DuckLake (DuckDB + optional PostGIS catalog)",
+        architecture={
+            "engine": "DuckDB",
+            "catalog": "Unified (DuckDB native + optional PostGIS)",
+            "service": "DuckLake"
+        },
+        endpoints={
             "GET /": "API information",
             "GET /health": "Health check",
+            "GET /catalogs": "List available catalog sources",
             "GET /query/nodes": "Get traffic nodes",
             "GET /query/corridors": "Get corridors",
             "GET /query/vehicles": "Get vehicles",
             "GET /query/h3": "Get H3 cells",
+            "GET /query/h3-cells": "Query features by H3 cell",
             "GET /query/all": "Get all data types",
+            "GET /partitions/{z}/{x}/{y}.parquet": "Get spatially-partitioned Parquet file",
+            "GET /partitions/{z}/{x}/{y}/data": "Get partition data as GeoJSON/raw",
+            "GET /partitions/manifest": "Get partition manifest",
             "GET /export/{data_type}": "Export data as Parquet file",
-            "POST /set-backend": "Switch database backend (PostGIS/DuckDB)"
+            "POST /set-catalog": "Configure DuckLake catalog"
         }
-    }
+    )
 
-@app.get("/health")
+
+@app.get(
+    "/health",
+    response_model=HealthStatus,
+    tags=["info"],
+    summary="Health check",
+    responses={
+        503: {"model": ErrorResponse, "description": "Service unavailable"}
+    }
+)
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with catalog status."""
     try:
         db_service = get_db_service()
-        if hasattr(db_service, 'health_check'):
-            health = db_service.health_check()
-            return JSONResponse(content={
-                "status": "healthy" if health['healthy'] else "unhealthy",
-                "database": health,
-                "timestamp": datetime.now().isoformat()
-            })
-        else:
-            return JSONResponse(content={
-                "status": "healthy",
-                "message": "Database service available",
-                "timestamp": datetime.now().isoformat()
-            })
+        health = db_service.health_check()
+        
+        return HealthStatus(
+            status="healthy" if health['healthy'] else "unhealthy",
+            catalog=health.get('catalog', 'unknown'),
+            latency_ms=health.get('latency', 0),
+            error=health.get('error')
+        )
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=503, detail=f"Service unavailable: {str(e)}")
+        raise HTTPException(status_code=503, detail=str(e))
 
-@app.get("/query/nodes")
+
+@app.get(
+    "/catalogs",
+    response_model=CatalogsResponse,
+    tags=["config"],
+    summary="List available catalog sources"
+)
+async def list_catalogs():
+    """List available catalog sources and current configuration."""
+    db_service = get_db_service()
+    health = db_service.health_check()
+    
+    available_catalogs = [
+        CatalogInfo(
+            name="duckdb",
+            description="Native DuckDB tables (in-memory or persistent)",
+            type="embedded"
+        ),
+        CatalogInfo(
+            name="postgis",
+            description="PostGIS database attached as catalog",
+            type="external"
+        )
+    ]
+    
+    return CatalogsResponse(
+        catalog=health.get('catalog', 'duckdb'),
+        healthy=health.get('healthy', False),
+        latency_ms=health.get('latency', 0),
+        available_catalogs=available_catalogs,
+        note="Use /set-catalog to configure catalog source"
+    )
+
+
+# Query Endpoints
+
+@app.get(
+    "/query/nodes",
+    response_model=NodesResponse,
+    tags=["queries"],
+    summary="Get traffic nodes",
+    responses={
+        422: {"model": ErrorResponse, "description": "Validation error"},
+        500: {"model": ErrorResponse, "description": "Server error"}
+    }
+)
 async def get_nodes(
-    south_west_lng: float = Query(..., description="Southwest longitude"),
-    south_west_lat: float = Query(..., description="Southwest latitude"),
-    north_east_lng: float = Query(..., description="Northeast longitude"),
-    north_east_lat: float = Query(..., description="Northeast latitude"),
-    node_types: Optional[List[str]] = Query(None, description="Filter by node types"),
-    min_saturation: Optional[float] = Query(None, description="Minimum saturation level (0-100)", ge=0, le=100),
-    limit: int = Query(500, description="Maximum number of results", ge=1, le=10000)
+    params: NodeQueryParams = Query(...)
 ):
-    """Get traffic nodes within a bounding box"""
+    """
+    Get traffic nodes within a bounding box.
+    
+    Returns GeoJSON FeatureCollection with node locations and metrics.
+    """
     try:
         bounds = {
-            'southWest': {'lng': south_west_lng, 'lat': south_west_lat},
-            'northEast': {'lng': north_east_lng, 'lat': north_east_lat}
+            'southWest': {'lng': params.south_west_lng, 'lat': params.south_west_lat},
+            'northEast': {'lng': params.north_east_lng, 'lat': params.north_east_lat}
         }
         
         db_service = get_db_service()
         nodes = db_service.get_nodes_in_bounds(
             bounds,
-            node_types=node_types,
-            min_saturation=min_saturation
+            node_types=params.node_types,
+            min_saturation=params.min_saturation
         )
         
-        # Apply limit if specified
-        if limit and len(nodes) > limit:
-            nodes = nodes[:limit]
+        # Apply limit
+        if params.limit and len(nodes) > params.limit:
+            nodes = nodes[:params.limit]
         
-        return JSONResponse(content={
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "id": node["id"],
-                        "name": node["name"],
-                        "node_type": node["type"],
-                        "passenger_throughput": node["metrics"]["passengerThroughput"],
-                        "average_dwell_time": node["metrics"]["averageDwellTime"],
-                        "peak_hour": node["metrics"]["peakHour"],
-                        "saturation_level": node["metrics"]["saturationLevel"],
-                        "connected_routes": node["connectedRoutes"]
-                    },
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [node["position"]["lng"], node["position"]["lat"]]
-                    }
-                }
-                for node in nodes
-            ],
-            "count": len(nodes),
-            "bbox": [south_west_lng, south_west_lat, north_east_lng, north_east_lat]
-        })
-    except Exception as e:
-        logger.error(f"Error fetching nodes: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/query/corridors")
-async def get_corridors(
-    south_west_lng: float = Query(..., description="Southwest longitude"),
-    south_west_lat: float = Query(..., description="Southwest latitude"),
-    north_east_lng: float = Query(..., description="Northeast longitude"),
-    north_east_lat: float = Query(..., description="Northeast latitude"),
-    limit: int = Query(200, description="Maximum number of results", ge=1, le=5000)
-):
-    """Get corridors within a bounding box"""
-    try:
-        bounds = {
-            'southWest': {'lng': south_west_lng, 'lat': south_west_lat},
-            'northEast': {'lng': north_east_lng, 'lat': north_east_lat}
-        }
-        
-        db_service = get_db_service()
-        corridors = db_service.get_corridors_in_bounds(bounds)
-        
-        # Apply limit if specified
-        if limit and len(corridors) > limit:
-            corridors = corridors[:limit]
-        
+        # Convert to GeoJSON
         features = []
-        for corridor in corridors:
-            # Extract coordinates from geometry (simplified for LineString)
-            coords = []
-            if corridor.get("geometry", {}).get("coordinates"):
-                coords = corridor["geometry"]["coordinates"]
-            
+        for node in nodes:
             features.append({
-                "type": "Feature",
-                "properties": {
-                    "id": corridor["id"],
-                    "name": corridor["name"],
-                    "start_node": corridor["startNode"],
-                    "end_node": corridor["endNode"],
-                    "fuel_burn_rate": corridor["metrics"]["fuelBurnRate"],
-                    "idling_hotspot_score": corridor["metrics"]["idlingHotspotScore"],
-                    "vehicle_stress_index": corridor["metrics"]["vehicleStressIndex"],
-                    "average_speed": corridor["metrics"]["averageSpeed"],
-                    "peak_flow_time": corridor["metrics"]["peakFlowTime"]
-                },
-                "geometry": corridor["geometry"] if corridor.get("geometry") else {
-                    "type": "LineString",
-                    "coordinates": coords
-                }
-            })
-        
-        return JSONResponse(content={
-            "type": "FeatureCollection",
-            "features": features,
-            "count": len(features),
-            "bbox": [south_west_lng, south_west_lat, north_east_lng, north_east_lat]
-        })
-    except Exception as e:
-        logger.error(f"Error fetching corridors: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/query/vehicles")
-async def get_vehicles(
-    south_west_lng: float = Query(..., description="Southwest longitude"),
-    south_west_lat: float = Query(..., description="Southwest latitude"),
-    north_east_lng: float = Query(..., description="Northeast longitude"),
-    north_east_lat: float = Query(..., description="Northeast latitude"),
-    status: Optional[str] = Query("active", description="Filter by vehicle status"),
-    limit: int = Query(1000, description="Maximum number of results", ge=1, le=10000)
-):
-    """Get vehicles within a bounding box"""
-    try:
-        bounds = {
-            'southWest': {'lng': south_west_lng, 'lat': south_west_lat},
-            'northEast': {'lng': north_east_lng, 'lat': north_east_lat}
-        }
-        
-        db_service = get_db_service()
-        vehicles = db_service.get_vehicles_in_bounds(bounds)
-        
-        # Filter by status if specified
-        if status:
-            vehicles = [v for v in vehicles if v["status"] == status]
-        
-        # Apply limit if specified
-        if limit and len(vehicles) > limit:
-            vehicles = vehicles[:limit]
-        
-        return JSONResponse(content={
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "properties": {
-                        "id": vehicle["id"],
-                        "sacco_id": vehicle["saccoId"],
-                        "sacco_name": vehicle["saccoName"],
-                        "plate_number": vehicle["plateNumber"],
-                        "capacity": vehicle["capacity"],
-                        "heading": vehicle["heading"],
-                        "speed": vehicle["speed"],
-                        "status": vehicle["status"],
-                        "last_updated": vehicle["lastUpdated"]
-                    },
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [
-                            vehicle["currentPosition"]["lng"],
-                            vehicle["currentPosition"]["lat"]
-                        ]
-                    }
-                }
-                for vehicle in vehicles
-            ],
-            "count": len(vehicles),
-            "bbox": [south_west_lng, south_west_lat, north_east_lng, north_east_lat]
-        })
-    except Exception as e:
-        logger.error(f"Error fetching vehicles: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/query/h3")
-async def get_h3_cells(
-    south_west_lng: float = Query(..., description="Southwest longitude"),
-    south_west_lat: float = Query(..., description="Southwest latitude"),
-    north_east_lng: float = Query(..., description="Northeast longitude"),
-    north_east_lat: float = Query(..., description="Northeast latitude"),
-    resolution: int = Query(9, description="H3 resolution (0-15)", ge=0, le=15),
-    limit: int = Query(5000, description="Maximum number of results", ge=1, le=20000)
-):
-    """Get H3 cells within a bounding box"""
-    try:
-        bounds = {
-            'southWest': {'lng': south_west_lng, 'lat': south_west_lat},
-            'northEast': {'lng': north_east_lng, 'lat': north_east_lat}
-        }
-        
-        db_service = get_db_service()
-        h3_cells = db_service.get_h3_cells_in_bounds(bounds, resolution=resolution)
-        
-        # Apply limit if specified
-        if limit and len(h3_cells) > limit:
-            h3_cells = h3_cells[:limit]
-        
-        features = []
-        for cell in h3_cells:
-            features.append({
-                "type": "Feature",
-                "properties": {
-                    "cell_id": cell["cellId"],
-                    "resolution": cell["resolution"],
-                    **cell["properties"]
-                },
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [cell["boundary"]["coordinates"][0]]  # Convert to proper GeoJSON format
-                }
-            })
-        
-        return JSONResponse(content={
-            "type": "FeatureCollection",
-            "features": features,
-            "count": len(features),
-            "bbox": [south_west_lng, south_west_lat, north_east_lng, north_east_lat]
-        })
-    except Exception as e:
-        logger.error(f"Error fetching H3 cells: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/query/all")
-async def get_all_data(
-    south_west_lng: float = Query(..., description="Southwest longitude"),
-    south_west_lat: float = Query(..., description="Southwest latitude"),
-    north_east_lng: float = Query(..., description="Northeast longitude"),
-    north_east_lat: float = Query(..., description="Northeast latitude"),
-    node_types: Optional[List[str]] = Query(None, description="Filter by node types"),
-    min_saturation: Optional[float] = Query(None, description="Minimum saturation level (0-100)", ge=0, le=100),
-    h3_resolution: int = Query(9, description="H3 resolution (0-15)", ge=0, le=15),
-    vehicle_limit: int = Query(1000, description="Limit for vehicle queries", ge=1, le=10000),
-    nodes_limit: int = Query(500, description="Limit for node queries", ge=1, le=10000),
-    corridors_limit: int = Query(200, description="Limit for corridor queries", ge=1, le=5000),
-    h3_limit: int = Query(5000, description="Limit for H3 queries", ge=1, le=20000)
-):
-    """Get all data types within a bounding box"""
-    try:
-        bounds = {
-            'southWest': {'lng': south_west_lng, 'lat': south_west_lat},
-            'northEast': {'lng': north_east_lng, 'lat': north_east_lat}
-        }
-        
-        db_service = get_db_service()
-        
-        # Fetch all data types
-        nodes = db_service.get_nodes_in_bounds(
-            bounds,
-            node_types=node_types,
-            min_saturation=min_saturation
-        )
-        
-        corridors = db_service.get_corridors_in_bounds(bounds)
-        vehicles = db_service.get_vehicles_in_bounds(bounds)
-        h3_cells = db_service.get_h3_cells_in_bounds(bounds, resolution=h3_resolution)
-        
-        # Apply limits
-        if nodes_limit and len(nodes) > nodes_limit:
-            nodes = nodes[:nodes_limit]
-        if corridors_limit and len(corridors) > corridors_limit:
-            corridors = corridors[:corridors_limit]
-        if vehicle_limit and len(vehicles) > vehicle_limit:
-            vehicles = vehicles[:vehicle_limit]
-        if h3_limit and len(h3_cells) > h3_limit:
-            h3_cells = h3_cells[:h3_limit]
-        
-        # Convert to GeoJSON FeatureCollections
-        nodes_features = [
-            {
                 "type": "Feature",
                 "properties": {
                     "id": node["id"],
@@ -390,14 +325,50 @@ async def get_all_data(
                     "type": "Point",
                     "coordinates": [node["position"]["lng"], node["position"]["lat"]]
                 }
-            }
-            for node in nodes
-        ]
+            })
         
-        corridors_features = []
+        return NodesResponse(
+            features=features,
+            count=len(features),
+            bbox=[
+                params.south_west_lng,
+                params.south_west_lat,
+                params.north_east_lng,
+                params.north_east_lat
+            ]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching nodes: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/query/corridors",
+    response_model=CorridorsResponse,
+    tags=["queries"],
+    summary="Get corridors"
+)
+async def get_corridors(
+    params: CorridorQueryParams = Query(...)
+):
+    """Get corridors within a bounding box."""
+    try:
+        bounds = {
+            'southWest': {'lng': params.south_west_lng, 'lat': params.south_west_lat},
+            'northEast': {'lng': params.north_east_lng, 'lat': params.north_east_lat}
+        }
+        
+        db_service = get_db_service()
+        corridors = db_service.get_corridors_in_bounds(bounds)
+        
+        if params.limit and len(corridors) > params.limit:
+            corridors = corridors[:params.limit]
+        
+        features = []
         for corridor in corridors:
-            coords = corridor.get("geometry", {}).get("coordinates", [])
-            corridors_features.append({
+            features.append({
                 "type": "Feature",
                 "properties": {
                     "id": corridor["id"],
@@ -410,14 +381,52 @@ async def get_all_data(
                     "average_speed": corridor["metrics"]["averageSpeed"],
                     "peak_flow_time": corridor["metrics"]["peakFlowTime"]
                 },
-                "geometry": corridor.get("geometry", {
-                    "type": "LineString",
-                    "coordinates": coords
-                })
+                "geometry": corridor.get("geometry", {"type": "LineString", "coordinates": []})
             })
         
-        vehicles_features = [
-            {
+        return CorridorsResponse(
+            features=features,
+            count=len(features),
+            bbox=[
+                params.south_west_lng,
+                params.south_west_lat,
+                params.north_east_lng,
+                params.north_east_lat
+            ]
+        )
+    except Exception as e:
+        logger.error(f"Error fetching corridors: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/query/vehicles",
+    response_model=VehiclesResponse,
+    tags=["queries"],
+    summary="Get vehicles"
+)
+async def get_vehicles(
+    params: VehicleQueryParams = Query(...)
+):
+    """Get vehicles within a bounding box."""
+    try:
+        bounds = {
+            'southWest': {'lng': params.south_west_lng, 'lat': params.south_west_lat},
+            'northEast': {'lng': params.north_east_lng, 'lat': params.north_east_lat}
+        }
+        
+        db_service = get_db_service()
+        vehicles = db_service.get_vehicles_in_bounds(bounds)
+        
+        if params.status:
+            vehicles = [v for v in vehicles if v["status"] == params.status]
+        
+        if params.limit and len(vehicles) > params.limit:
+            vehicles = vehicles[:params.limit]
+        
+        features = []
+        for vehicle in vehicles:
+            features.append({
                 "type": "Feature",
                 "properties": {
                     "id": vehicle["id"],
@@ -437,202 +446,108 @@ async def get_all_data(
                         vehicle["currentPosition"]["lat"]
                     ]
                 }
-            }
-            for vehicle in vehicles
-        ]
+            })
         
-        h3_features = []
+        return VehiclesResponse(
+            features=features,
+            count=len(features),
+            bbox=[
+                params.south_west_lng,
+                params.south_west_lat,
+                params.north_east_lng,
+                params.north_east_lat
+            ]
+        )
+    except Exception as e:
+        logger.error(f"Error fetching vehicles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/query/h3",
+    response_model=H3CellsResponse,
+    tags=["queries"],
+    summary="Get H3 cells"
+)
+async def get_h3_cells(
+    params: H3QueryParams = Query(...)
+):
+    """Get H3 cells within a bounding box."""
+    try:
+        bounds = {
+            'southWest': {'lng': params.south_west_lng, 'lat': params.south_west_lat},
+            'northEast': {'lng': params.north_east_lng, 'lat': params.north_east_lat}
+        }
+        
+        db_service = get_db_service()
+        h3_cells = db_service.get_h3_cells_in_bounds(
+            bounds,
+            resolution=params.resolution
+        )
+        
+        if params.limit and len(h3_cells) > params.limit:
+            h3_cells = h3_cells[:params.limit]
+        
+        features = []
         for cell in h3_cells:
-            h3_features.append({
+            features.append({
                 "type": "Feature",
                 "properties": {
                     "cell_id": cell["cellId"],
                     "resolution": cell["resolution"],
-                    **cell["properties"]
+                    **cell.get("properties", {})
                 },
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [cell["boundary"]["coordinates"][0]]
-                }
+                "geometry": cell["boundary"]
             })
         
-        return JSONResponse(content={
-            "nodes": {
-                "type": "FeatureCollection",
-                "features": nodes_features,
-                "count": len(nodes_features)
-            },
-            "corridors": {
-                "type": "FeatureCollection",
-                "features": corridors_features,
-                "count": len(corridors_features)
-            },
-            "vehicles": {
-                "type": "FeatureCollection",
-                "features": vehicles_features,
-                "count": len(vehicles_features)
-            },
-            "h3_cells": {
-                "type": "FeatureCollection",
-                "features": h3_features,
-                "count": len(h3_features)
-            },
-            "bbox": [south_west_lng, south_west_lat, north_east_lng, north_east_lat],
-            "timestamp": datetime.now().isoformat()
-        })
+        return H3CellsResponse(
+            features=features,
+            count=len(features),
+            bbox=[
+                params.south_west_lng,
+                params.south_west_lat,
+                params.north_east_lng,
+                params.north_east_lat
+            ]
+        )
     except Exception as e:
-        logger.error(f"Error fetching all data: {e}")
+        logger.error(f"Error fetching H3 cells: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/export/{data_type}")
-async def export_data(
-    data_type: str,
-    south_west_lng: float = Query(..., description="Southwest longitude"),
-    south_west_lat: float = Query(..., description="Southwest latitude"),
-    north_east_lng: float = Query(..., description="Northeast longitude"),
-    north_east_lat: float = Query(..., description="Northeast latitude"),
-    node_types: Optional[List[str]] = Query(None, description="Filter by node types"),
-    min_saturation: Optional[float] = Query(None, description="Minimum saturation level (0-100)", ge=0, le=100),
-    h3_resolution: int = Query(9, description="H3 resolution (0-15)", ge=0, le=15),
-    validate: bool = Query(True, description="Validate Parquet file after creation"),
-    background_tasks: BackgroundTasks = BackgroundTasks()
-):
-    """Export data as Parquet file"""
-    try:
-        # Validate data_type
-        valid_types = ["nodes", "corridors", "vehicles", "h3", "all"]
-        if data_type not in valid_types:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid data type. Must be one of: {', '.join(valid_types)}"
-            )
-        
-        bounds = {
-            'southWest': {'lng': south_west_lng, 'lat': south_west_lat},
-            'northEast': {'lng': north_east_lng, 'lat': north_east_lat}
-        }
-        
-        db_service = get_db_service()
-        
-        # Create temporary directory for export
-        export_dir = Path("./temp_exports")
-        export_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{data_type}_{timestamp}.parquet"
-        filepath = export_dir / filename
-        
-        # Export based on data type
-        if data_type == "nodes":
-            data = db_service.get_nodes_in_bounds(
-                bounds,
-                node_types=node_types,
-                min_saturation=min_saturation
-            )
-            parquet_exporter.export_nodes(data, str(filepath), validate=validate)
-            
-        elif data_type == "corridors":
-            data = db_service.get_corridors_in_bounds(bounds)
-            parquet_exporter.export_corridors(data, str(filepath), validate=validate)
-            
-        elif data_type == "vehicles":
-            data = db_service.get_vehicles_in_bounds(bounds)
-            parquet_exporter.export_vehicles(data, str(filepath), validate=validate)
-            
-        elif data_type == "h3":
-            data = db_service.get_h3_cells_in_bounds(bounds, resolution=h3_resolution)
-            parquet_exporter.export_h3_cells(data, str(filepath), validate=validate)
-            
-        elif data_type == "all":
-            # For 'all', we'll create a combined export or just export nodes as primary
-            # In a real implementation, you might want to export multiple files or use a different format
-            data = db_service.get_nodes_in_bounds(
-                bounds,
-                node_types=node_types,
-                min_saturation=min_saturation
-            )
-            parquet_exporter.export_nodes(data, str(filepath), validate=validate)
-        
-        # Schedule cleanup of old files (older than 1 hour)
-        def cleanup_old_files():
-            try:
-                now = datetime.now().timestamp()
-                for file in export_dir.glob("*.parquet"):
-                    if now - file.stat().st_mtime > 3600:  # 1 hour
-                        file.unlink()
-                        logger.info(f"Cleaned up old export file: {file}")
-            except Exception as e:
-                logger.error(f"Error cleaning up old files: {e}")
-        
-        background_tasks.add_task(cleanup_old_files)
-        
-        # Return the file
-        return FileResponse(
-            path=str(filepath),
-            filename=filename,
-            media_type='application/octet-stream'
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error exporting {data_type}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/set-backend")
-async def set_backend(backend: str = Query(..., description="Database backend: postgis or duckdb")):
-    """Switch database backend"""
-    global current_db_service
-    
-    if backend.lower() == "postgis":
-        current_db_service = postgis_service
-        logger.info("Switched to PostGIS backend")
-        return {"message": "Switched to PostGIS backend", "backend": "postgis"}
-    elif backend.lower() == "duckdb":
-        current_db_service = duckdb_service
-        logger.info("Switched to DuckDB backend")
-        return {"message": "Switched to DuckDB backend", "backend": "duckdb"}
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid backend. Must be 'postgis' or 'duckdb'"
-        )
+# Additional endpoints would be added here...
 
-@app.get("/backends")
-async def list_backends():
-    """List available database backends"""
-    return {
-        "available": ["postgis", "duckdb"],
-        "current": "duckdb" if current_db_service == duckdb_service else "postgis",
-        "note": "DuckDB is the default backend. PostGIS is maintained for backward compatibility only."
-    }
+# Partition Endpoints
 
-@app.get("/partitions/{z}/{x}/{y}.parquet")
+@app.get(
+    "/partitions/{z}/{x}/{y}.parquet",
+    tags=["partitions"],
+    summary="Get partitioned Parquet file",
+    response_class=FileResponse
+)
 async def get_partition(
-    z: int,
-    x: int,
-    y: int,
-    city: str = Query("nairobi", description="City identifier"),
-    country: str = Query("KE", description="Country code")
+    params: PartitionExportParams = Query(...)
 ):
-    """Get a spatially-partitioned Parquet file by z/x/y coordinates (Three-Layer: Quadtree)"""
+    """Get a spatially-partitioned Parquet file by z/x/y coordinates."""
     try:
-        from fastapi.responses import FileResponse
-        from pathlib import Path
-        
-        # Construct partition path
-        partition_path = Path(f"./partitions/{country.lower()}/{city.lower()}/z{z}/{x}/{y}.parquet")
+        partition_path = Path(
+            f"./partitions/{params.country.lower()}/{params.city.lower()}"
+            f"/z{params.z}/{params.x}/{params.y}.parquet"
+        )
         
         if not partition_path.exists():
-            raise HTTPException(status_code=404, detail=f"Partition not found: z={z}, x={x}, y={y}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Partition not found: z={params.z}, x={params.x}, y={params.y}"
+            )
         
         return FileResponse(
             path=str(partition_path),
             media_type="application/octet-stream",
             headers={
-                "X-Partition-Z": str(z),
-                "X-Partition-X": str(x),
-                "X-Partition-Y": str(y),
+                "X-Partition-Z": str(params.z),
+                "X-Partition-X": str(params.x),
+                "X-Partition-Y": str(params.y),
                 "Cache-Control": "public, max-age=3600"
             }
         )
@@ -642,192 +557,77 @@ async def get_partition(
         logger.error(f"Error fetching partition: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/partitions/{z}/{x}/{y}/data")
-async def get_partition_data(
-    z: int,
-    x: int,
-    y: int,
-    city: str = Query("nairobi", description="City identifier"),
-    country: str = Query("KE", description="Country code"),
-    format: str = Query("geojson", description="Output format: geojson or raw")
+
+# Configuration Endpoints
+
+@app.post(
+    "/set-catalog",
+    response_model=CatalogSetResponse,
+    tags=["config"],
+    summary="Configure DuckLake catalog"
+)
+async def set_catalog(
+    params: CatalogConfig = Query(...)
 ):
-    """
-    Get partitioned data as GeoJSON or raw Parquet bytes.
-    Three-Layer: Quadtree (z/x/y) + H3 (pre-filter) + Z-order (sorted)
-    """
+    """Configure DuckLake catalog source."""
+    global current_db_service
+    
     try:
-        import duckdb
-        from shapely import wkb
-        
-        partition_path = Path(f"./partitions/{country.lower()}/{city.lower()}/z{z}/{x}/{y}.parquet")
-        
-        if not partition_path.exists():
-            raise HTTPException(status_code=404, detail=f"Partition not found")
-        
-        if format == "raw":
-            # Return raw Parquet bytes
-            with open(partition_path, 'rb') as f:
-                data = f.read()
-            return Response(content=data, media_type="application/octet-stream")
-        
-        # Read partition with DuckDB and convert to GeoJSON
-        conn = duckdb.connect(":memory:")
-        conn.execute("INSTALL spatial; LOAD spatial")
-        
-        result = conn.execute(f"""
-            SELECT
-                osm_id,
-                feature_type,
-                name,
-                ST_GeomFromWKB(wkb_geom) as geom,
-                h3_8,
-                zorder_key,
-                highway,
-                building,
-                amenity
-            FROM read_parquet('{partition_path}')
-            LIMIT 10000
-        """).fetchall()
-        
-        conn.close()
-        
-        # Convert to GeoJSON FeatureCollection
-        features = []
-        for row in result:
-            feature = {
-                "type": "Feature",
-                "properties": {
-                    "osm_id": row[0],
-                    "feature_type": row[1],
-                    "name": row[2],
-                    "h3_8": row[4],
-                    "zorder_key": row[5],
-                    "highway": row[6],
-                    "building": row[7],
-                    "amenity": row[8]
-                },
-                "geometry": json.loads(wkb.loads(bytes(row[3])).__geo_interface__)
+        if params.catalog.lower() == "postgis":
+            if not all([params.host, params.database, params.user, params.password]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="PostGIS catalog requires host, database, user, and password"
+                )
+            
+            postgis_config = {
+                'host': params.host,
+                'port': str(params.port),
+                'database': params.database,
+                'user': params.user,
+                'password': params.password
             }
-            features.append(feature)
+            
+            # Create new DuckLake service with PostGIS catalog
+            current_db_service = DuckLakeService(
+                db_path=":memory:",
+                memory_limit="2GB",
+                threads=4,
+                postgis_catalog=postgis_config
+            )
+            
+            logger.info(f"Switched to DuckLake with PostGIS catalog: {params.host}:{params.port}/{params.database}")
+            
+            return CatalogSetResponse(
+                message="Switched to DuckLake with PostGIS catalog",
+                catalog="postgis",
+                host=params.host,
+                database=params.database
+            )
         
-        return JSONResponse(content={
-            "type": "FeatureCollection",
-            "tile": {"z": z, "x": x, "y": y},
-            "features": features,
-            "count": len(features)
-        })
+        elif params.catalog.lower() == "duckdb":
+            current_db_service = DuckLakeService(
+                db_path=":memory:",
+                memory_limit="2GB",
+                threads=4,
+                postgis_catalog=None
+            )
+            
+            logger.info("Switched to DuckLake (DuckDB only)")
+            
+            return CatalogSetResponse(
+                message="Switched to DuckLake (DuckDB only)",
+                catalog="duckdb"
+            )
         
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid catalog. Must be 'postgis' or 'duckdb'"
+            )
+    
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error reading partition data: {e}")
+        logger.error(f"Failed to set catalog: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/partitions/manifest")
-async def get_manifest(
-    city: str = Query("nairobi", description="City identifier"),
-    country: str = Query("KE", description="Country code")
-):
-    """Get partition manifest for a city (Three-Layer: Metadata)"""
-    try:
-        manifest_path = Path(f"./partitions/{country.lower()}/{city.lower()}/manifest.json")
-        
-        if not manifest_path.exists():
-            raise HTTPException(status_code=404, detail=f"Manifest not found for {city}")
-        
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-        
-        return JSONResponse(content=manifest)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error reading manifest: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/query/h3-cells")
-async def query_h3_cells(
-    h3_cell: str = Query(..., description="H3 cell ID (e.g., 881f24a4b7fffff)"),
-    city: str = Query("nairobi", description="City identifier"),
-    country: str = Query("KE", description="Country code"),
-    resolution: int = Query(8, description="H3 resolution to query", ge=7, le=10)
-):
-    """
-    Query features by H3 cell (Three-Layer: H3 semantic indexing).
-    Uses Layer 2 (H3) for fast pre-filtering across all tiles.
-    """
-    try:
-        import duckdb
-        from pathlib import Path
-        
-        # Find which tiles might contain this H3 cell
-        # In production, this would use the manifest for efficient tile lookup
-        tile_pattern = Path(f"./tiles/{country.lower()}/{city.lower()}/z10/*/*.parquet")
-        
-        conn = duckdb.connect(":memory:")
-        conn.execute("INSTALL spatial; LOAD spatial")
-        
-        h3_col = f"h3_{resolution}"
-        
-        result = conn.execute(f"""
-            SELECT 
-                osm_id,
-                feature_type,
-                name,
-                ST_GeomFromWKB(wkb_geom) as geom,
-                {h3_col},
-                centroid_lat,
-                centroid_lng
-            FROM read_parquet('{tile_pattern}')
-            WHERE {h3_col} = '{h3_cell}'
-            LIMIT 10000
-        """).fetchall()
-        
-        conn.close()
-        
-        # Convert to GeoJSON
-        features = []
-        for row in result:
-            feature = {
-                "type": "Feature",
-                "properties": {
-                    "osm_id": row[0],
-                    "feature_type": row[1],
-                    "name": row[2],
-                    "h3_cell": row[4],
-                    "centroid": [row[6], row[5]]
-                },
-                "geometry": json.loads(wkb.loads(bytes(row[3])).__geo_interface__)
-            }
-            features.append(feature)
-        
-        return JSONResponse(content={
-            "type": "FeatureCollection",
-            "h3_cell": h3_cell,
-            "h3_resolution": resolution,
-            "features": features,
-            "count": len(features)
-        })
-        
-    except Exception as e:
-        logger.error(f"Error querying H3 cells: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Add custom exception handler
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    logger.error(f"Unhandled exception: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"}
-    )
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "himap.API.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )

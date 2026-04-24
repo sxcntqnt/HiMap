@@ -1,13 +1,26 @@
-# HiMap PostGIS Migration Requirements
+# HiMap v2.0 - DuckLake Architecture Requirements
+# DuckLake = DuckDB (engine) + PostGIS (optional catalog)
+
 # Core dependencies
 certifi==2024.2.2
 charset-normalizer==3.3.2
 idna==3.7
 urllib3==2.2.1
 
-# Database connectivity
+# HTTP Server
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.9  # For form data parsing
+
+# Pydantic (included with FastAPI but pin version)
+pydantic==2.5.3
+pydantic-core==2.14.6
+
+# Database Engine (DuckDB)
+duckdb==1.0.0
+
+# PostgreSQL connector for PostGIS catalog support
 psycopg2-binary==2.9.9
-duckdb==1.0.0  # For future migration from PostGIS
 
 # Spatial data processing
 shapely==2.0.4
@@ -16,11 +29,14 @@ shapely==2.0.4
 pyarrow==15.0.2
 pandas==2.2.2
 
-# Optional: for progress bars (kept from original)
+# Optional: for progress bars
 tqdm==4.66.2
 
 # Colorama for Windows compatibility
 colorama==0.4.6
 
-# Geographiclib for distance calculations (kept from original)
+# Geographiclib for distance calculations
 geographiclib==2.0
+
+# CORS middleware
+python-jose==3.3.0  # For JWT if needed

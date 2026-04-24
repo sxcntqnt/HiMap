@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-HiMap Spatial Data HTTP Server
-Run this script to start the FastAPI server
+HiMap v2.0 Spatial Data HTTP Server
+Run this script to start the FastAPI server with DuckLake architecture
+
+DuckLake = DuckDB (engine) + Optional PostGIS catalog
 """
 
 import uvicorn
@@ -21,7 +23,10 @@ logger = logging.getLogger(__name__)
 
 def main():
     """Main function to run the server"""
-    logger.info("Starting HiMap Spatial Data HTTP Server with DuckDB as default backend (PostGIS deprecated)...")
+    logger.info("=" * 60)
+    logger.info("HiMap v2.0 - DuckLake Spatial Data API")
+    logger.info("Architecture: DuckDB engine + Optional PostGIS catalog")
+    logger.info("=" * 60)
     
     try:
         # Run the FastAPI application with Uvicorn
