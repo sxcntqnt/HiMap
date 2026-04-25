@@ -244,7 +244,7 @@ class Partitioner:
     Usage:
         p = Partitioner(db_path="./data/osm.duckdb", output_dir="./lake")
         manifest = p.run_pipeline(
-            source_table="osm_raw",
+            source_table="osm",
             city_id="nairobi",
             country_code="KE"
         )
@@ -295,63 +295,94 @@ class Partitioner:
     # Keeps the expensive geometry operations in DuckDB (vectorized).
     # ------------------------------------------------------------------
 
-    def _build_staging_table(self, source_table: str) -> str:
+    def _build_staging_table(self, source_table: str, config) -> str:
         """
         Stages 1–4: compute quadtree address, H3 indices, and zorder key
         for every feature in source_table.
+
+        Source schema (osm table):
+            feature_id  VARCHAR               — already stable, e.g. 'relation/1809123'
+            tags        MAP(VARCHAR, VARCHAR)  — all OSM tags, accessed via tags['key']
+            geometry    BLOB                  — WKB geometry
+            filename    VARCHAR               — source parquet file
+            country     VARCHAR               — country identifier
+
+        H3 pattern matches the existing enrichment pipeline:
+            printf('%x', h3_latlng_to_cell(lat, lng, res)::BIGINT)
 
         Returns the name of the staging table.
         """
         conn = self._conn()
         staging = f"_stage_{source_table}"
 
+        # H3 columns using the confirmed printf pattern
         h3_selects = ",\n                    ".join([
-            f"h3_latlng_to_cell_string("
-            f"ST_Y(ST_Centroid(ST_GeomFromWKB(wkb_geom))), "
-            f"ST_X(ST_Centroid(ST_GeomFromWKB(wkb_geom))), "
-            f"{res}) AS h3_{res}"
+            f"printf('%x', h3_latlng_to_cell("
+            f"ST_Y(ST_Centroid(ST_GeomFromWKB(geometry))), "
+            f"ST_X(ST_Centroid(ST_GeomFromWKB(geometry))), "
+            f"{res})::BIGINT) AS h3_{res}"
             for res in self.h3_resolutions
         ])
 
         z = self.partition_zoom
 
+        # Filter from registry config — country and/or bbox, or '1=1' for no filter
+        where_clause = config.source_filter_sql()
+
         try:
             conn.execute(f"""
                 CREATE OR REPLACE TABLE {staging} AS
                 SELECT
-                    -- Identity
-                    CAST(osm_id AS VARCHAR)                         AS feature_id,
-                    COALESCE(feature_type, 'unknown')               AS feature_type,
-                    wkb_geom                                        AS geometry,
-                    ST_Y(ST_Centroid(ST_GeomFromWKB(wkb_geom)))    AS centroid_lat,
-                    ST_X(ST_Centroid(ST_GeomFromWKB(wkb_geom)))    AS centroid_lng,
-                    country_code,
+                    -- Identity (feature_id already stable in source)
+                    feature_id,
 
-                    -- Layer 2: H3
+                    -- Feature type derived from tags (priority order)
+                    CASE
+                        WHEN tags['highway']  IS NOT NULL THEN 'road'
+                        WHEN tags['building'] IS NOT NULL THEN 'building'
+                        WHEN tags['amenity']  IS NOT NULL THEN 'amenity'
+                        WHEN tags['landuse']  IS NOT NULL THEN 'landuse'
+                        WHEN tags['natural']  IS NOT NULL THEN 'natural'
+                        WHEN tags['waterway'] IS NOT NULL THEN 'waterway'
+                        WHEN tags['boundary'] IS NOT NULL THEN 'boundary'
+                        ELSE 'unknown'
+                    END                                              AS feature_type,
+
+                    -- Geometry (already WKB BLOB — no rename needed)
+                    geometry,
+
+                    -- Centroid coords (computed once, stored flat for query speed)
+                    ST_Y(ST_Centroid(ST_GeomFromWKB(geometry)))     AS centroid_lat,
+                    ST_X(ST_Centroid(ST_GeomFromWKB(geometry)))     AS centroid_lng,
+
+                    -- Country (source column is 'country', contract calls it 'country_code')
+                    country                                          AS country_code,
+
+                    -- Layer 2: H3 indices (printf pattern matches enrichment pipeline)
                     {h3_selects},
 
-                    -- Layer 1: Quadtree
+                    -- Layer 1: Quadtree address from centroid
                     {z}                                              AS tile_z,
                     CAST(FLOOR(
-                        ((ST_X(ST_Centroid(ST_GeomFromWKB(wkb_geom))) + 180.0) / 360.0)
+                        ((ST_X(ST_Centroid(ST_GeomFromWKB(geometry))) + 180.0) / 360.0)
                         * POW(2, {z})
                     ) AS INTEGER)                                    AS tile_x,
                     CAST(FLOOR(
                         (1.0 - LN(
-                            TAN(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(wkb_geom)))))
-                            + 1.0 / COS(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(wkb_geom)))))
+                            TAN(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(geometry)))))
+                            + 1.0 / COS(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(geometry)))))
                         ) / PI()) / 2.0 * POW(2, {z})
                     ) AS INTEGER)                                    AS tile_y,
 
-                    -- OSM semantic fields
-                    highway,
-                    building,
-                    amenity,
-                    landuse,
-                    CAST(population AS INTEGER)                      AS population,
+                    -- OSM semantic fields extracted from tags MAP
+                    tags['highway']                                  AS highway,
+                    tags['building']                                 AS building,
+                    tags['amenity']                                  AS amenity,
+                    tags['landuse']                                  AS landuse,
+                    TRY_CAST(tags['population'] AS INTEGER)         AS population,
 
-                    -- road_class lookup (stored at ingestion, not query time)
-                    CASE highway
+                    -- road_class: stored at ingestion, not derived at query time
+                    CASE tags['highway']
                         WHEN 'motorway'  THEN 1
                         WHEN 'trunk'     THEN 2
                         WHEN 'primary'   THEN 3
@@ -361,27 +392,29 @@ class Partitioner:
                     END::TINYINT                                     AS road_class
 
                 FROM {source_table}
-                WHERE wkb_geom IS NOT NULL
+                WHERE {where_clause}
             """)
 
-            # Layer 3: zorder — morton(h3_cell, feature_id)
-            # Uses h3_8 as the primary spatial anchor (neighborhood scale)
-            h3_col = f"h3_{self.h3_resolutions[1]}"   # second resolution = h3_8
+            # Layer 3: zorder_key = morton(h3_cell, feature_id)
+            # h3_8 is the spatial anchor (neighborhood scale).
+            # feature_id is a string like 'relation/1809123' — use hash() not CAST.
+            # hash() returns a stable 64-bit integer in DuckDB.
+            h3_col = f"h3_{self.h3_resolutions[1]}"  # h3_8
 
-            conn.execute(f"""
-                ALTER TABLE {staging} ADD COLUMN zorder_key BIGINT
-            """)
+            conn.execute(f"ALTER TABLE {staging} ADD COLUMN zorder_key BIGINT")
+
             conn.execute(f"""
                 UPDATE {staging}
                 SET zorder_key = (
                     (h3_string_to_cell({h3_col}) & 0xFFFFFFFF) << 32
-                    | (CAST(feature_id AS BIGINT) & 0xFFFFFFFF)
+                    | (hash(feature_id) & 0xFFFFFFFF)
                 )
                 WHERE {h3_col} IS NOT NULL
             """)
+
             conn.execute(f"""
                 UPDATE {staging}
-                SET zorder_key = CAST(feature_id AS BIGINT) & 0xFFFFFFFF
+                SET zorder_key = hash(feature_id) & 0xFFFFFFFF
                 WHERE zorder_key IS NULL
             """)
 
@@ -659,7 +692,6 @@ class Partitioner:
     def _write_manifest(
         self,
         tiles: List[Dict[str, Any]],
-        city_id: str,
         country_code: str,
         output_path: Path,
     ) -> Dict[str, Any]:
@@ -672,7 +704,7 @@ class Partitioner:
         tile_keys = []
         for t in tiles:
             cdn_path = (
-                f"{country_code.lower()}/{city_id.lower()}/"
+                f"{country_code.lower()}/"
                 f"z{t['z']}/{t['x']}/{t['y']}.parquet"
             )
 
@@ -700,7 +732,6 @@ class Partitioner:
             })
 
         manifest = {
-            "cityId":        city_id,
             "countryCode":   country_code,
             "tileZoom":      self.partition_zoom,
             "h3Resolutions": self.h3_resolutions,
@@ -728,32 +759,44 @@ class Partitioner:
 
     def run_pipeline(
         self,
-        source_table: str,
-        city_id: str = "nairobi",
-        country_code: str = "KE",
+        dataset_key: str,
+        source_table: str = "osm",
     ) -> Dict[str, Any]:
         """
-        Run the full 11-stage pipeline for one source table.
+        Run the full 11-stage pipeline for a registered dataset.
 
         Args:
-            source_table:  DuckDB table to read from (e.g. 'osm_raw')
-            city_id:       City identifier used in output paths
-            country_code:  ISO-2 country code
+            dataset_key:   Key in the dataset registry (e.g. 'canary', 'kenya').
+                           Controls source filtering and output path.
+            source_table:  DuckDB table to read from (default: 'osm').
 
         Returns:
             Manifest dict (also written to disk as manifest.json)
         """
-        logger.info(f"Pipeline start — {country_code}/{city_id} from {source_table}")
+        from .dataset_registry import registry
 
-        # Stages 1–4
-        staging = self._build_staging_table(source_table)
+        config = registry.get(dataset_key)
+        country_code = config.country
 
-        # Stages 5–9
+        logger.info(
+            f"Pipeline start — dataset={dataset_key} "
+            f"country={country_code} "
+            f"filter={config.country_filter or 'none'} "
+            f"bbox={config.bbox or 'none'} "
+            f"source={source_table}"
+        )
+
+        # Stages 1–4: staging with filter applied from config
+        staging = self._build_staging_table(source_table, config)
+
+        # Stages 5–9: entropy and importance
         entropy_metrics = self._compute_entropy_metrics(staging)
         importance_map  = self._compute_importance_bytes(staging)
 
         # Stage 10: export per tile
-        output_path = self.output_dir / country_code.lower() / city_id.lower()
+        # Output path: {output_dir}/{country_lower}/
+        # No city subdirectory — partitioner is country-scoped
+        output_path = self.output_dir / country_code.lower()
         output_path.mkdir(parents=True, exist_ok=True)
 
         conn = self._conn()
@@ -782,8 +825,8 @@ class Partitioner:
         finally:
             conn.close()
 
-        # Stage 11
-        manifest = self._write_manifest(exported, city_id, country_code, output_path)
+        # Stage 11: manifest
+        manifest = self._write_manifest(exported, country_code, output_path)
 
         logger.info(
             f"Pipeline complete — {manifest['tile_count']} tiles, "

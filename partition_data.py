@@ -15,12 +15,15 @@ Runs the HiMap v3.0 eleven-stage pipeline:
     10. export                (Parquet, sorted by entropy_bucket + zorder + importance)
     11. write_catalog         (manifest.json with SSE manager fields)
 
-Output: spatially-partitioned Parquet files for analytical queries.
-NOT map tiles. z/x/y addresses geographic organization, not rendering zoom.
+Dataset filtering (country, bbox) is driven by the dataset registry.
+No --city argument — the pipeline is country-scoped.
 
 Usage:
-    python partition_data.py --db-path ./data/osm.duckdb --city nairobi --country KE
-    python partition_data.py --db-path ./data/osm.duckdb --city mombasa --country KE
+    python partition_data.py --db-path ./data/osm.duckdb --dataset canary
+    python partition_data.py --db-path ./data/osm.duckdb --dataset kenya
+    python partition_data.py --db-path ./data/africa.duckdb --dataset canary --dry-run
+
+To add a new dataset, register it in himap/dataset_registry.py first.
 """
 
 import argparse
@@ -31,7 +34,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from himap.Export.Partitioner import Partitioner   # v3.0 — no TilePartitioner
+from himap.Export.Partitioner import Partitioner
+from himap.dataset_registry import registry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,41 +49,79 @@ def main() -> int:
         description="Partition OSM data — HiMap v3.0 pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Registered datasets are defined in himap/dataset_registry.py.
+
 Examples:
-    %(prog)s --db-path ./data/osm.duckdb --city nairobi --country KE
-    %(prog)s --db-path ./data/osm.duckdb --city lagos   --country NG --output ./lake
-    %(prog)s --db-path ./data/osm.duckdb --city nairobi --country KE --dry-run
+    %(prog)s --db-path ./data/osm.duckdb --dataset canary
+    %(prog)s --db-path ./data/osm.duckdb --dataset kenya --output ./lake
+    %(prog)s --db-path ./data/osm.duckdb --dataset canary --dry-run
         """,
     )
 
-    parser.add_argument("--db-path",   required=True,  help="Path to DuckDB database file")
-    parser.add_argument("--city",      default="nairobi", help="City identifier (default: nairobi)")
-    parser.add_argument("--country",   default="KE",      help="ISO-2 country code (default: KE)")
-    parser.add_argument("--table",     default="osm_raw",
-                        help="Source table in DuckDB (default: osm_raw)")
-    parser.add_argument("--output",    default="./lake",
-                        help="Output directory for partitioned Parquet lake (default: ./lake)")
-    parser.add_argument("--zoom",      type=int, default=10,
-                        help="Quadtree zoom level (default: 10)")
-    parser.add_argument("--target-features", type=int, default=50000,
-                        help="Target features per partition (default: 50000)")
-    parser.add_argument("--h3-resolutions", default="7,8,9,10",
-                        help="Comma-separated H3 resolutions (default: 7,8,9,10)")
-    parser.add_argument("--dry-run",   action="store_true",
-                        help="Validate config and report without writing files")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Path to DuckDB database file containing the osm table",
+    )
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        help=f"Dataset key from registry. Registered: {registry.list()}",
+    )
+    parser.add_argument(
+        "--table",
+        default="osm",
+        help="Source table in DuckDB (default: osm)",
+    )
+    parser.add_argument(
+        "--output",
+        default="./lake",
+        help="Output root for partitioned Parquet lake (default: ./lake)",
+    )
+    parser.add_argument(
+        "--zoom",
+        type=int,
+        default=10,
+        help="Quadtree zoom level (default: 10)",
+    )
+    parser.add_argument(
+        "--target-features",
+        type=int,
+        default=50000,
+        help="Target features per partition (default: 50000)",
+    )
+    parser.add_argument(
+        "--h3-resolutions",
+        default="7,8,9,10",
+        help="Comma-separated H3 resolutions (default: 7,8,9,10)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate dataset config and report without writing files",
+    )
 
     args = parser.parse_args()
 
+    # Validate dataset key early — fail fast before any DB work
+    if args.dataset not in registry:
+        logger.error(
+            f"Unknown dataset: '{args.dataset}'. "
+            f"Registered datasets: {registry.list()}"
+        )
+        return 1
+
+    config = registry.get(args.dataset)
     h3_resolutions = [int(r.strip()) for r in args.h3_resolutions.split(",")]
 
     logger.info("HiMap Partitioner v3.0")
-    logger.info(f"  Database : {args.db_path}")
-    logger.info(f"  City     : {args.city}")
-    logger.info(f"  Country  : {args.country}")
-    logger.info(f"  Table    : {args.table}")
-    logger.info(f"  Output   : {args.output}")
-    logger.info(f"  Zoom     : {args.zoom}")
-    logger.info(f"  H3 res   : {h3_resolutions}")
+    logger.info(f"  Dataset    : {args.dataset}")
+    logger.info(f"  Country    : {config.country}")
+    logger.info(f"  Filter     : country='{config.country_filter or 'none'}' bbox={config.bbox or 'none'}")
+    logger.info(f"  Source     : {args.db_path} → table '{args.table}'")
+    logger.info(f"  Output     : {args.output}/{config.country.lower()}/")
+    logger.info(f"  Zoom       : {args.zoom}")
+    logger.info(f"  H3 res     : {h3_resolutions}")
 
     if args.dry_run:
         logger.info("DRY RUN — no files will be written")
@@ -95,19 +137,19 @@ Examples:
         )
 
         manifest = partitioner.run_pipeline(
+            dataset_key=args.dataset,
             source_table=args.table,
-            city_id=args.city,
-            country_code=args.country,
         )
 
         # Summary
+        country = config.country.lower()
         logger.info("=" * 60)
         logger.info("PIPELINE COMPLETE")
         logger.info("=" * 60)
         logger.info(f"Tiles exported   : {manifest['tile_count']}")
         logger.info(f"Total features   : {manifest['total_features']:,}")
-        logger.info(f"Output           : {args.output}/{args.country.lower()}/{args.city.lower()}")
-        logger.info(f"Manifest         : {args.output}/{args.country.lower()}/{args.city.lower()}/manifest.json")
+        logger.info(f"Output           : {args.output}/{country}/")
+        logger.info(f"Manifest         : {args.output}/{country}/manifest.json")
 
         # Top 10 tiles by feature count
         logger.info("")
@@ -122,19 +164,14 @@ Examples:
             )
 
         # Next steps
-        country = args.country.lower()
-        city    = args.city.lower()
         logger.info("")
         logger.info("Next steps:")
-        logger.info(f"  1. Register dataset:")
-        logger.info(f"       registry.register('{city}', DatasetConfig(")
-        logger.info(f"           country='{args.country}',")
-        logger.info(f"           base_path='{args.output}/{country}/{city}/'")
-        logger.info(f"       ))")
-        logger.info(f"  2. Build DuckDB view:")
-        logger.info(f"       view_generator.create_enriched_view('{city}', config)")
-        logger.info(f"  3. Upload to storage:")
-        logger.info(f"       rclone copy {args.output}/{country}/{city} r2:himap-lake/{country}/{city}")
+        logger.info(f"  1. Build DuckDB views:")
+        logger.info(f"       from himap.view_generator import ViewGenerator")
+        logger.info(f"       vg = ViewGenerator(ducklake_service)")
+        logger.info(f"       vg.build('{args.dataset}')")
+        logger.info(f"  2. Upload to storage:")
+        logger.info(f"       rclone copy {args.output}/{country} r2:himap-lake/{country}")
 
         return 0
 
