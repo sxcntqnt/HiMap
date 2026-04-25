@@ -19,9 +19,9 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ...dataset_registry import registry
-from ...Services.DuckLakeService import ducklake_service
-from ...view_generator import ViewGenerator
+from ..Ingestion.DataRegistry import registry
+from ..Services.DuckLakeService import ducklake_service
+from ..Generator.viewGenerator import ViewGenerator
 from ..Models.requests import BBoxQueryParams, H3QueryParams
 from ..Models.responses import Feature, FeaturesResponse
 

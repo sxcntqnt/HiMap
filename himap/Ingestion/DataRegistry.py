@@ -24,7 +24,7 @@ That is the only change required to make a new dataset queryable.
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -174,13 +174,20 @@ registry = DatasetRegistry()
 
 _LAKE_ROOT = os.getenv("HIMAP_LAKE_ROOT", "./lake")
 
+# IMPORTANT: country_filter values must match the OSM source table's
+# `country` column exactly — these are admin-boundary strings, not ISO codes.
+# Confirmed values from the data:
+#   'canary-islands'  (not 'ES', not 'Spain', not 'Canary Islands')
+#   'kenya'           (not 'KE', not 'Kenya')
+# Run: SELECT DISTINCT country FROM osm; to verify values for new datasets.
+
 registry.register(
     "canary",
     DatasetConfig(
         country="ES",
         base_path=os.getenv("HIMAP_DATASET_CANARY", f"{_LAKE_ROOT}/es/"),
         h3_resolutions=[7, 8, 9, 10],
-        country_filter="canary-islands",   # matches osm.country column value
+        country_filter="canary-islands",   # exact match against osm.country column
     ),
 )
 
@@ -190,11 +197,11 @@ registry.register(
         country="KE",
         base_path=os.getenv("HIMAP_DATASET_KENYA", f"{_LAKE_ROOT}/ke/"),
         h3_resolutions=[7, 8, 9, 10],
-        country_filter="kenya",
+        country_filter="kenya",            # exact match against osm.country column
     ),
 )
 
-# Whole-Africa dataset — no filter, processes all rows
+# Whole-Africa dataset — no filter, processes all rows in the source table
 # registry.register(
 #     "africa",
 #     DatasetConfig(
@@ -205,13 +212,17 @@ registry.register(
 #     ),
 # )
 
-# Add new datasets here and nowhere else:
+# Adding a new dataset:
+# 1. Run: SELECT DISTINCT country FROM osm WHERE country LIKE '%tanzania%';
+#    to confirm the exact country column value in the source data.
+# 2. Register here with that exact string as country_filter.
+# 3. Run the pipeline: python partition_data.py --dataset tanzania
 #
 # registry.register(
-#     "lagos",
+#     "tanzania",
 #     DatasetConfig(
-#         country="NG",
-#         base_path=os.getenv("HIMAP_DATASET_LAGOS", f"{_LAKE_ROOT}/ng/"),
-#         country_filter="nigeria",
+#         country="TZ",
+#         base_path=os.getenv("HIMAP_DATASET_TANZANIA", f"{_LAKE_ROOT}/tz/"),
+#         country_filter="tanzania",   # verify against SELECT DISTINCT country FROM osm
 #     ),
 # )

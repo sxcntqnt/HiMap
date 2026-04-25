@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 import json
 
-from ...dataset_registry import registry
+from ..Ingestion.DataRegistry import registry
 
 logger = logging.getLogger(__name__)
 

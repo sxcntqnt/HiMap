@@ -34,8 +34,8 @@ Rules:
 import logging
 from typing import List, Optional
 
-from .Services.DuckLakeService import DuckLakeService
-from .dataset_registry import DatasetConfig, DatasetRegistry, registry as default_registry
+from ..Services.DuckLakeService import DuckLakeService
+from ..Ingestion.DataRegistry import DatasetConfig, DatasetRegistry, registry as default_registry
 
 logger = logging.getLogger(__name__)
 

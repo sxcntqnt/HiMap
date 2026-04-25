@@ -13,11 +13,7 @@ uvicorn[standard]==0.27.0
 python-multipart==0.0.9  # For form data parsing
 
 # Pydantic (included with FastAPI but pin version)
-pydantic==2.5.3
-pydantic-core==2.14.6
-
-# Database Engine (DuckDB)
-duckdb==1.0.0
+pydantic>=2.10
 
 # PostgreSQL connector for PostGIS catalog support
 # Database connectivity
@@ -42,4 +38,3 @@ geographiclib==2.1
 
 # CORS middleware
 python-jose==3.3.0  # For JWT if needed
-=======

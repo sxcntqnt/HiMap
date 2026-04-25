@@ -1,3 +1,0 @@
-[submodule "himap/Export/Writer/parquet-stream-write"]
-	path = himap/Export/Writer/parquet-stream-write
-	url = https://github.com/apcamargo/parquet-stream-writer

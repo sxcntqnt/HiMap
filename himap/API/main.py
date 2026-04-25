@@ -29,12 +29,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ..Services.DuckLakeService import ducklake_service
-from ..dataset_registry import registry
-from ..view_generator import ViewGenerator
-from .Models.responses import ErrorDetail, ErrorResponse
-from .routes.catalog import router as catalog_router
-from .routes.partitions import router as partitions_router
-from .routes.query import router as query_router
+from ..Ingestion.DataRegistry import registry
+from ..Towns import town_registry
+from ..Generator.viewGenerator import ViewGenerator
+from ..Models.responses import ErrorDetail, ErrorResponse, APIRootResponse
+from ..Routes.RoutesCatalog import router as catalog_router
+from ..Routes.RoutesPartinitions import router as partitions_router
+from ..Routes.RoutesQuery import router as query_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -147,6 +148,11 @@ async def root():
             "GET /datasets":                                 "List registered datasets",
             "GET /datasets/{key}":                           "Dataset config",
             "GET /datasets/{key}/views":                     "DuckDB view state",
+            "GET /datasets/{key}/towns":                     "Towns linked to a dataset",
+            "GET /towns":                                    "List all registered towns",
+            "GET /towns/{key}":                              "Town config + spatial fields",
+            "GET /towns/{key}/bbox-params":                  "Ready-to-use params for /query/all",
+            "GET /towns/{key}/h3-params":                    "Ready-to-use params for /query/h3",
             "GET /query/all?dataset=&sw_lng=...":            "Bounding box query",
             "GET /query/h3?dataset=&h3_index=...":           "H3 index query",
             "GET /partitions/{dataset}/{z}/{x}/{y}.parquet": "Serve Parquet partition",
@@ -163,7 +169,8 @@ async def root():
 async def startup():
     logger.info("=" * 60)
     logger.info("HiMap v3.0 starting")
-    logger.info(f"Registered datasets: {registry.list()}")
+    logger.info(f"Registered datasets : {registry.list()}")
+    logger.info(f"Registered towns    : {town_registry.list()}")
     logger.info("=" * 60)
 
     # Health check

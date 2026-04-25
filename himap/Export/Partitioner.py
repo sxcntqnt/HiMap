@@ -54,7 +54,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..Services.DuckLakeService import DuckLakeService
-from .Writer.parquet_stream_writer.src.parquet_stream_writer import ParquetStreamWriter
+from parquet_stream_writer import ParquetStreamWriter
 
 logger = logging.getLogger(__name__)
 
