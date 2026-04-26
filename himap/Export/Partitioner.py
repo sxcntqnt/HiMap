@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 LOCKED_SCHEMA = pa.schema([
     ("feature_id",            pa.string()),
     ("feature_type",          pa.string()),
-    ("geometry",              pa.binary()),       # WKB
+    ("geometry",              pa.binary()), 
     ("centroid_lat",          pa.float64()),
     ("centroid_lng",          pa.float64()),
     ("country_code",          pa.string()),
@@ -318,8 +318,8 @@ class Partitioner:
         # H3 columns using the confirmed printf pattern
         h3_selects = ",\n                    ".join([
             f"printf('%x', h3_latlng_to_cell("
-            f"ST_Y(ST_Centroid(ST_GeomFromWKB(geometry))), "
-            f"ST_X(ST_Centroid(ST_GeomFromWKB(geometry))), "
+            f"ST_Y(ST_Centroid(ST_GeomFromWKB(geom))), "
+            f"ST_X(ST_Centroid(ST_GeomFromWKB(geom))), "
             f"{res})::BIGINT) AS h3_{res}"
             for res in self.h3_resolutions
         ])
@@ -349,11 +349,11 @@ class Partitioner:
                     END                                              AS feature_type,
 
                     -- Geometry (already WKB BLOB — no rename needed)
-                    geometry,
+                    geom,
 
                     -- Centroid coords (computed once, stored flat for query speed)
-                    ST_Y(ST_Centroid(ST_GeomFromWKB(geometry)))     AS centroid_lat,
-                    ST_X(ST_Centroid(ST_GeomFromWKB(geometry)))     AS centroid_lng,
+                    ST_Y(ST_Centroid(ST_GeomFromWKB(geom)))     AS centroid_lat,
+                    ST_X(ST_Centroid(ST_GeomFromWKB(geom)))     AS centroid_lng,
 
                     -- Country (source column is 'country', contract calls it 'country_code')
                     country                                          AS country_code,
@@ -364,13 +364,13 @@ class Partitioner:
                     -- Layer 1: Quadtree address from centroid
                     {z}                                              AS tile_z,
                     CAST(FLOOR(
-                        ((ST_X(ST_Centroid(ST_GeomFromWKB(geometry))) + 180.0) / 360.0)
+                        ((ST_X(ST_Centroid(ST_GeomFromWKB(geom))) + 180.0) / 360.0)
                         * POW(2, {z})
                     ) AS INTEGER)                                    AS tile_x,
                     CAST(FLOOR(
                         (1.0 - LN(
-                            TAN(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(geometry)))))
-                            + 1.0 / COS(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(geometry)))))
+                            TAN(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(geom)))))
+                            + 1.0 / COS(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(geom)))))
                         ) / PI()) / 2.0 * POW(2, {z})
                     ) AS INTEGER)                                    AS tile_y,
 
@@ -403,18 +403,22 @@ class Partitioner:
 
             conn.execute(f"ALTER TABLE {staging} ADD COLUMN zorder_key BIGINT")
 
+
+            MASK31 = 2147483647  # 2^31 - 1
+            SHIFT31 = 2147483648  # 2^31
+
             conn.execute(f"""
                 UPDATE {staging}
                 SET zorder_key = (
-                    (h3_string_to_cell({h3_col}) & 0xFFFFFFFF) << 32
-                    | (hash(feature_id) & 0xFFFFFFFF)
+                    ((h3_string_to_h3({h3_col}) % {MASK31}) * {SHIFT31})
+                    + (hash(feature_id) % {MASK31})
                 )
                 WHERE {h3_col} IS NOT NULL
             """)
 
             conn.execute(f"""
                 UPDATE {staging}
-                SET zorder_key = hash(feature_id) & 0xFFFFFFFF
+                SET zorder_key = hash(feature_id) & 4294967295
                 WHERE zorder_key IS NULL
             """)
 
@@ -425,8 +429,10 @@ class Partitioner:
         except Exception as e:
             logger.error(f"Staging failed for {source_table}: {e}")
             raise
+
         finally:
             conn.close()
+
 
     # ------------------------------------------------------------------
     # Stages 5–9: entropy, buckets, importance, hysteresis
@@ -572,7 +578,7 @@ class Partitioner:
             SELECT
                 feature_id,
                 feature_type,
-                geometry,
+                geom AS geometry,
                 centroid_lat,
                 centroid_lng,
                 country_code,
@@ -773,7 +779,7 @@ class Partitioner:
         Returns:
             Manifest dict (also written to disk as manifest.json)
         """
-        from .dataset_registry import registry
+        from ..Ingestion.DataRegistry import registry
 
         config = registry.get(dataset_key)
         country_code = config.country

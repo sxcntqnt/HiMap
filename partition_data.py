@@ -35,7 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from himap.Export.Partitioner import Partitioner
-from himap.dataset_registry import registry
+from himap.Ingestion.DataRegistry import registry
 
 logging.basicConfig(
     level=logging.INFO,

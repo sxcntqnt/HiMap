@@ -78,12 +78,13 @@ class DatasetConfig:
         """Enriched DuckDB view name (centroid + H3 + entropy columns)."""
         return f"{key}_enriched"
 
+
     def source_filter_sql(self) -> str:
         """
         Return the WHERE clause fragment for ingestion-time filtering.
         Returns '1=1' when no filter is configured (process all rows).
         """
-        clauses = ["geometry IS NOT NULL"]
+        clauses = ["geom IS NOT NULL"]
 
         if self.country_filter:
             clauses.append(f"country = '{self.country_filter}'")
@@ -92,7 +93,7 @@ class DatasetConfig:
             sw_lng, sw_lat, ne_lng, ne_lat = self.bbox
             clauses.append(
                 f"ST_Intersects("
-                f"ST_GeomFromWKB(geometry), "
+                f"ST_GeomFromWKB(geom), "
                 f"ST_MakeEnvelope({sw_lng}, {sw_lat}, {ne_lng}, {ne_lat})"
                 f")"
             )

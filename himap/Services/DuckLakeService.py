@@ -82,7 +82,7 @@ class DuckLakeService:
         try:
             conn.execute("INSTALL spatial")
             conn.execute("LOAD spatial")
-            conn.execute("INSTALL h3")
+            conn.execute("INSTALL h3 from community")
             conn.execute("LOAD h3")
 
             if self.postgis_catalog:
