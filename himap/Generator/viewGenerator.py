@@ -190,23 +190,84 @@ class ViewGenerator:
         """)
 
     # ------------------------------------------------------------------
+    # Zoom-aware query helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _zoom_limit(zoom: Optional[int]) -> int:
+        """
+        Return the appropriate feature limit for a given zoom level.
+
+        At low zoom the user sees the whole city — only high-importance
+        landmarks matter. At street zoom, every feature in the viewport
+        is meaningful.
+
+        Zoom range → limit:
+            0–9  (continental → metro):  500   — only major features
+            10–12 (city):               2000   — key infrastructure
+            13–15 (neighborhood):       5000   — full street detail
+            16+  (street):              5000   — maximum detail
+        """
+        if zoom is None:
+            return 5000
+        if zoom <= 9:
+            return 500
+        if zoom <= 12:
+            return 2000
+        return 5000
+
+    @staticmethod
+    def _importance_threshold(zoom: Optional[int]) -> int:
+        """
+        Return the minimum importance_byte for a given zoom level.
+
+        At low zoom, only high-importance features (hospitals, major roads,
+        landmarks) should be returned. At street zoom, all features qualify.
+
+        importance_byte is 0–127. Higher = more important.
+
+        Zoom range → min importance:
+            0–9:   80  — only top ~37% by importance (landmarks, motorways)
+            10–12: 40  — top ~69% (main roads, commercial, amenities)
+            13+:    0  — everything
+        """
+        if zoom is None:
+            return 0
+        if zoom <= 9:
+            return 80
+        if zoom <= 12:
+            return 40
+        return 0
+
+    # ------------------------------------------------------------------
     # Query helpers (used by API layer — no SQL outside this module)
     # ------------------------------------------------------------------
 
-    def bbox_query(self, key: str) -> str:
+    def bbox_query(self, key: str, zoom: Optional[int] = None) -> str:
         """
-        Return parameterized SQL for a bounding box query against the
-        enriched view.
+        Return parameterized SQL for a bounding box query.
 
         Parameters (positional):
             sw_lng, sw_lat, ne_lng, ne_lat
 
+        Zoom-aware:
+            - Limit scales with zoom (500 at metro, 5000 at street)
+            - importance_byte threshold filters low-importance features
+              at low zoom levels — only landmarks at metro scale
+
         Usage:
-            sql = vg.bbox_query("nairobi")
+            sql = vg.bbox_query("nairobi", zoom=12)
             rows = ducklake.execute(sql, (sw_lng, sw_lat, ne_lng, ne_lat))
         """
-        config = self.registry.get(key)
-        view = config.enriched_view_name(key)
+        config   = self.registry.get(key)
+        view     = config.enriched_view_name(key)
+        limit    = self._zoom_limit(zoom)
+        min_imp  = self._importance_threshold(zoom)
+
+        importance_clause = (
+            f"AND importance_byte >= {min_imp}" if min_imp > 0 else ""
+        )
+
         return f"""
             SELECT *
             FROM {view}
@@ -214,24 +275,32 @@ class ViewGenerator:
                 centroid_geom,
                 ST_MakeEnvelope(?, ?, ?, ?)
             )
+            {importance_clause}
             ORDER BY entropy_bucket ASC, importance_byte DESC
-            LIMIT 5000
+            LIMIT {limit}
         """
 
-    def h3_query(self, key: str, resolution: int = 8) -> str:
+    def h3_query(self, key: str, resolution: int = 8, zoom: Optional[int] = None) -> str:
         """
         Return parameterized SQL for an H3 index query.
 
         Parameters (positional):
             h3_index  (string)
 
+        Zoom-aware:
+            - Resolution defaults to 8 but should be passed from
+              zoom_levels.h3_resolution_for_zoom(zoom)
+            - Limit and importance threshold scale with zoom
+
         Usage:
-            sql = vg.h3_query("nairobi", resolution=8)
+            sql = vg.h3_query("nairobi", resolution=8, zoom=12)
             rows = ducklake.execute(sql, (h3_index,))
         """
-        config = self.registry.get(key)
-        view = config.view_name(key)   # base view — no geometry derivation needed
-        h3_col = f"h3_{resolution}"
+        config  = self.registry.get(key)
+        view    = config.view_name(key)
+        h3_col  = f"h3_{resolution}"
+        limit   = self._zoom_limit(zoom)
+        min_imp = self._importance_threshold(zoom)
 
         if resolution not in config.h3_resolutions:
             raise ValueError(
@@ -239,10 +308,31 @@ class ViewGenerator:
                 f"Available: {config.h3_resolutions}"
             )
 
+        importance_clause = (
+            f"AND importance_byte >= {min_imp}" if min_imp > 0 else ""
+        )
+
         return f"""
             SELECT *
             FROM {view}
             WHERE {h3_col} = ?
+            {importance_clause}
             ORDER BY importance_byte DESC
-            LIMIT 5000
+            LIMIT {limit}
         """
+
+    def h3_query_for_zoom(self, key: str, zoom: int) -> str:
+        """
+        Return parameterized SQL for an H3 index query, deriving resolution
+        and limit automatically from the map zoom level.
+
+        Parameters (positional):
+            h3_index  (string)
+
+        Usage:
+            sql = vg.h3_query_for_zoom("nairobi", zoom=12)
+            # → queries h3_8, limit=2000, importance >= 40
+        """
+        from .Utils.Zoom import zoom_levels
+        resolution = zoom_levels.h3_resolution_for_zoom(zoom)
+        return self.h3_query(key, resolution=resolution, zoom=zoom)
