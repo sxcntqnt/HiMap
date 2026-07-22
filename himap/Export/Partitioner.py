@@ -1,8 +1,16 @@
 """
-Spatial Partitioning Pipeline — HiMap v3.0
+Spatial Partitioning Pipeline — HiMap v3.0 (schema v3.1)
 
 Contract: every feature written by this pipeline must satisfy the locked schema.
 No backward compatibility with v2.0.
+
+v3.1 note: the locked schema was extended to add nullable building-specific
+columns (floorspace, occupancy, height_raw/height_m/height_floors, quadkey,
+relation_id, source_provider, area_m2, perimeter_m) so that OpenBuildingMap
+datasets can flow through the same 11-stage pipeline as OSM. OSM rows leave
+these NULL; building rows leave the OSM semantic fields (highway, amenity,
+landuse, population, road_class) NULL. This is a deliberate, additive schema
+change — nothing existing was renamed or repurposed.
 
 Locked schema (every Parquet file, every shard, no exceptions):
     feature_id            STRING        globally stable, immutable
@@ -18,13 +26,31 @@ Locked schema (every Parquet file, every shard, no exceptions):
     tile_z                INT
     tile_x                INT
     tile_y                INT
-    zorder_key            BIGINT        morton(h3_cell, feature_id) — row micro-ordering
+    zorder_key             BIGINT        morton(h3_cell, feature_id) — row micro-ordering
     entropy_bucket        INT           macro partition assignment (0–9)
     cell_variance         FLOAT         adaptive resolution trigger
     importance_byte       TINYINT       quantized I(S) 0–255
     entropy_score         FLOAT         Shannon entropy of feature_type distribution per H3 cell
     compressed_size_bytes BIGINT        estimated at write time
     partition_run_id      STRING        hash(H3_Index + Timestamp)
+    -- OSM semantic fields (NULL for building datasets)
+    highway               STRING
+    building              STRING
+    amenity               STRING
+    landuse               STRING
+    population            INT
+    road_class            TINYINT
+    -- Building semantic fields (NULL for OSM datasets)
+    floorspace            STRING
+    occupancy             STRING        RES / COM / IND / CIV / UNK
+    height_raw            STRING        original encoding, e.g. 'HBET:1-2'
+    height_m              DOUBLE
+    height_floors         DOUBLE
+    quadkey               STRING        legacy Bing quadkey, kept for interop
+    relation_id           STRING
+    source_provider       STRING        'OSM' / 'Google' / 'Microsoft' etc.
+    area_m2               DOUBLE        computed in a projected CRS, not degrees
+    perimeter_m           DOUBLE
 
 Pipeline stages (in order, non-negotiable):
     1. load_source          — read from DuckDB source table
@@ -38,6 +64,13 @@ Pipeline stages (in order, non-negotiable):
     9. apply_hysteresis     — stability filter, suppress partition churn
     10. export              — write Parquet sorted by (entropy_bucket, zorder_key, importance_byte DESC)
     11. write_catalog       — emit manifest with all SSE manager fields
+
+Dataset entry points (stage 1 has two implementations, everything downstream
+is shared):
+    _build_staging_table            — OSM: reads tags MAP, feature_id, geom
+    _build_staging_table_buildings   — Buildings: reads discrete columns
+                                        (id, geometry, occupancy, height, ...),
+                                        no tags map required
 """
 
 import hashlib
@@ -66,7 +99,7 @@ logger = logging.getLogger(__name__)
 LOCKED_SCHEMA = pa.schema([
     ("feature_id",            pa.string()),
     ("feature_type",          pa.string()),
-    ("geometry",              pa.binary()), 
+    ("geometry",              pa.binary()),
     ("centroid_lat",          pa.float64()),
     ("centroid_lng",          pa.float64()),
     ("country_code",          pa.string()),
@@ -86,11 +119,22 @@ LOCKED_SCHEMA = pa.schema([
     ("partition_run_id",      pa.string()),
     # OSM semantic fields
     ("highway",               pa.string()),
-    ("building",              pa.string()),
+    ("building",               pa.string()),
     ("amenity",               pa.string()),
     ("landuse",               pa.string()),
     ("population",            pa.int32()),
     ("road_class",            pa.int8()),
+    # Building semantic fields (v3.1)
+    ("floorspace",            pa.string()),
+    ("occupancy",             pa.string()),
+    ("height_raw",            pa.string()),
+    ("height_m",              pa.float64()),
+    ("height_floors",         pa.float64()),
+    ("quadkey",               pa.string()),
+    ("relation_id",           pa.string()),
+    ("source_provider",       pa.string()),
+    ("area_m2",               pa.float64()),
+    ("perimeter_m",           pa.float64()),
 ])
 
 
@@ -111,6 +155,12 @@ CLASS_WEIGHTS = {
     "commercial":  0.6,
     "residential": 0.3,
     "utility":     0.1,
+    # Building occupancy codes (lowercased) — same weight scale as OSM tags
+    "civ":         0.7,
+    "com":         0.6,
+    "ind":         0.4,
+    "res":         0.3,
+    "unk":         0.1,
 }
 
 def _importance_score(
@@ -118,18 +168,23 @@ def _importance_score(
     building_tag: Optional[str],
     amenity_tag: Optional[str],
     neighbor_count: int,
+    occupancy: Optional[str] = None,
     dist_to_traj: float = 5000.0,
 ) -> float:
     """
     Compute I(S) per the locked Semantic Zoom Contract formula.
     Returns float in [0, 1].
     dist_to_traj defaults to 5000m (no trajectory known at ingestion time).
+
+    `occupancy` is the building-dataset classification (RES/COM/IND/CIV/UNK).
+    It's used as a fallback tag when building_tag/amenity_tag aren't present
+    (which is always, for building datasets — they don't carry OSM tags).
     """
     # A_norm: log-normalized area, prevents industrial bloat
     a_norm = min(1.0, math.log10(max(area, 1) / 500 + 1) / 2)
 
     # C_type: class weight from tag lookup
-    tag = building_tag or amenity_tag or ""
+    tag = building_tag or amenity_tag or occupancy or ""
     c_type = CLASS_WEIGHTS.get(tag.lower(), 0.1)
 
     # D_local: density penalty via neighbor count
@@ -238,16 +293,16 @@ class Partitioner:
     Three-layer spatial partitioning pipeline for HiMap v3.0.
 
     Produces Parquet files conforming to the locked schema contract.
-    Dataset-agnostic: behavior is identical for Canary Islands, Kenya,
-    or any registered dataset. Path resolution is the only variable.
+    Dataset-agnostic downstream of staging: entropy, importance, export,
+    and manifest stages are identical for OSM and building datasets. Only
+    stage 1 (load_source/staging) differs, because the two source schemas
+    genuinely differ (OSM tags MAP vs. discrete building columns) — see
+    _build_staging_table vs _build_staging_table_buildings.
 
     Usage:
         p = Partitioner(db_path="./data/osm.duckdb", output_dir="./lake")
-        manifest = p.run_pipeline(
-            source_table="osm",
-            city_id="nairobi",
-            country_code="KE"
-        )
+        manifest = p.run_pipeline(dataset_key="kenya", source_table="osm")
+        manifest = p.run_pipeline(dataset_key="kenya-buildings", source_table="buildings")
     """
 
     def __init__(
@@ -291,7 +346,38 @@ class Partitioner:
         return conn
 
     # ------------------------------------------------------------------
-    # Stage 1 + 2 + 3 + 4: quadtree + H3 + zorder in one SQL pass
+    # Shared: zorder_key (stage 4) — identical for every dataset kind.
+    # zorder_key = morton(h3_cell, feature_id)
+    # h3_8 is the spatial anchor (neighborhood scale).
+    # feature_id may be a string like 'relation/1809123' or
+    # 'building/796743226' — use hash(), not CAST.
+    # ------------------------------------------------------------------
+
+    def _apply_zorder_key(self, conn: duckdb.DuckDBPyConnection, staging: str) -> None:
+        h3_col = f"h3_{self.h3_resolutions[1]}"  # h3_8
+
+        conn.execute(f"ALTER TABLE {staging} ADD COLUMN zorder_key BIGINT")
+
+        MASK31 = 2147483647   # 2^31 - 1
+        SHIFT31 = 2147483648  # 2^31
+
+        conn.execute(f"""
+            UPDATE {staging}
+            SET zorder_key = (
+                ((h3_string_to_h3({h3_col}) % {MASK31}) * {SHIFT31})
+                + (hash(feature_id) % {MASK31})
+            )
+            WHERE {h3_col} IS NOT NULL
+        """)
+
+        conn.execute(f"""
+            UPDATE {staging}
+            SET zorder_key = hash(feature_id) & 4294967295
+            WHERE zorder_key IS NULL
+        """)
+
+    # ------------------------------------------------------------------
+    # Stage 1 + 2 + 3 + 4 (OSM): quadtree + H3 + zorder in one SQL pass
     # Keeps the expensive geometry operations in DuckDB (vectorized).
     # ------------------------------------------------------------------
 
@@ -389,38 +475,25 @@ class Partitioner:
                         WHEN 'secondary' THEN 4
                         WHEN 'tertiary'  THEN 5
                         ELSE 6
-                    END::TINYINT                                     AS road_class
+                    END::TINYINT                                     AS road_class,
+
+                    -- Building semantic fields — not applicable to OSM rows
+                    NULL::VARCHAR                                    AS floorspace,
+                    NULL::VARCHAR                                    AS occupancy,
+                    NULL::VARCHAR                                    AS height_raw,
+                    NULL::DOUBLE                                     AS height_m,
+                    NULL::DOUBLE                                     AS height_floors,
+                    NULL::VARCHAR                                    AS quadkey,
+                    NULL::VARCHAR                                    AS relation_id,
+                    NULL::VARCHAR                                    AS source_provider,
+                    NULL::DOUBLE                                     AS area_m2,
+                    NULL::DOUBLE                                     AS perimeter_m
 
                 FROM {source_table}
                 WHERE {where_clause}
             """)
 
-            # Layer 3: zorder_key = morton(h3_cell, feature_id)
-            # h3_8 is the spatial anchor (neighborhood scale).
-            # feature_id is a string like 'relation/1809123' — use hash() not CAST.
-            # hash() returns a stable 64-bit integer in DuckDB.
-            h3_col = f"h3_{self.h3_resolutions[1]}"  # h3_8
-
-            conn.execute(f"ALTER TABLE {staging} ADD COLUMN zorder_key BIGINT")
-
-
-            MASK31 = 2147483647  # 2^31 - 1
-            SHIFT31 = 2147483648  # 2^31
-
-            conn.execute(f"""
-                UPDATE {staging}
-                SET zorder_key = (
-                    ((h3_string_to_h3({h3_col}) % {MASK31}) * {SHIFT31})
-                    + (hash(feature_id) % {MASK31})
-                )
-                WHERE {h3_col} IS NOT NULL
-            """)
-
-            conn.execute(f"""
-                UPDATE {staging}
-                SET zorder_key = hash(feature_id) & 4294967295
-                WHERE zorder_key IS NULL
-            """)
+            self._apply_zorder_key(conn, staging)
 
             count = conn.execute(f"SELECT COUNT(*) FROM {staging}").fetchone()[0]
             logger.info(f"Staging complete: {count:,} features in {staging}")
@@ -433,10 +506,166 @@ class Partitioner:
         finally:
             conn.close()
 
+    # ------------------------------------------------------------------
+    # Stage 1 + 2 + 3 + 4 (Buildings): same quadtree/H3/zorder logic as
+    # OSM, but reading from discrete building columns instead of a tags
+    # MAP. No OSM-specific concepts (highway/amenity/landuse/population)
+    # apply here — those columns are left NULL.
+    # ------------------------------------------------------------------
+
+    def _build_staging_table_buildings(self, source_table: str, config) -> str:
+        """
+        Stages 1–4 for OpenBuildingMap sources.
+
+        Source schema (buildings table, materialized from parquet by
+        BuildingConfig.materialize_to_duckdb):
+            id          BIGINT
+            floorspace  VARCHAR
+            occupancy   VARCHAR    — 'UNK', 'RES', 'COM', 'IND', 'CIV'
+            relation_id VARCHAR
+            quadkey     VARCHAR
+            last_update TIMESTAMP WITH TIME ZONE
+            height      VARCHAR    — 'H:n' / 'HBET:a-b' / 'HHT:x' / numeric / NULL
+            geometry    BLOB       — WKB polygon/multipolygon
+            bbox        STRUCT(xmin, ymin, xmax, ymax)
+            source      VARCHAR    — 'OSM' / 'Google' / 'Microsoft'
+
+        height parsing (matches the enrichment contract):
+            'H:n'       -> floors=n,        height_m = n * 3.5
+            'HBET:a-b'  -> floors=(a+b)/2,  height_m = floors * 3.5
+            'HHT:x'     -> height_m=x,      floors = x / 3.5
+            '12.5'      -> height_m=12.5,   floors = height_m / 3.5
+            NULL/other  -> both NULL
+
+        area_m2/perimeter_m are computed via ST_Transform into config's
+        utm_epsg — NOT raw ST_Area on WGS84 coordinates, which would be
+        degrees² and meaningless.
+
+        Returns the name of the staging table.
+        """
+        conn = self._conn()
+        staging = f"_stage_{source_table}"
+
+        h3_selects = ",\n                    ".join([
+            f"printf('%x', h3_latlng_to_cell("
+            f"ST_Y(ST_Centroid(ST_GeomFromWKB(geometry))), "
+            f"ST_X(ST_Centroid(ST_GeomFromWKB(geometry))), "
+            f"{res})::BIGINT) AS h3_{res}"
+            for res in self.h3_resolutions
+        ])
+
+        z = self.partition_zoom
+        where_clause = config.quadkey_filter_sql()
+        utm_epsg = getattr(config, "utm_epsg", None) or 32637  # default: UTM 37N (Kenya)
+
+        height_m_case = """
+            CASE
+                WHEN height ~ '^H:[0-9]+(\\.[0-9]+)?$'
+                    THEN CAST(regexp_extract(height, '^H:([0-9]+(\\.[0-9]+)?)', 1) AS DOUBLE) * 3.5
+                WHEN height ~ '^HBET:[0-9]+(\\.[0-9]+)?-[0-9]+(\\.[0-9]+)?$'
+                    THEN (
+                        CAST(regexp_extract(height, '^HBET:([0-9]+(\\.[0-9]+)?)-', 1) AS DOUBLE)
+                      + CAST(regexp_extract(height, '-([0-9]+(\\.[0-9]+)?)$', 1) AS DOUBLE)
+                    ) / 2.0 * 3.5
+                WHEN height ~ '^HHT:[0-9]+(\\.[0-9]+)?$'
+                    THEN CAST(regexp_extract(height, '^HHT:([0-9]+(\\.[0-9]+)?)', 1) AS DOUBLE)
+                WHEN TRY_CAST(height AS DOUBLE) IS NOT NULL
+                    THEN TRY_CAST(height AS DOUBLE)
+                ELSE NULL
+            END
+        """
+
+        height_floors_case = """
+            CASE
+                WHEN height ~ '^H:[0-9]+(\\.[0-9]+)?$'
+                    THEN CAST(regexp_extract(height, '^H:([0-9]+(\\.[0-9]+)?)', 1) AS DOUBLE)
+                WHEN height ~ '^HBET:[0-9]+(\\.[0-9]+)?-[0-9]+(\\.[0-9]+)?$'
+                    THEN (
+                        CAST(regexp_extract(height, '^HBET:([0-9]+(\\.[0-9]+)?)-', 1) AS DOUBLE)
+                      + CAST(regexp_extract(height, '-([0-9]+(\\.[0-9]+)?)$', 1) AS DOUBLE)
+                    ) / 2.0
+                WHEN height ~ '^HHT:[0-9]+(\\.[0-9]+)?$'
+                    THEN CAST(regexp_extract(height, '^HHT:([0-9]+(\\.[0-9]+)?)', 1) AS DOUBLE) / 3.5
+                WHEN TRY_CAST(height AS DOUBLE) IS NOT NULL
+                    THEN TRY_CAST(height AS DOUBLE) / 3.5
+                ELSE NULL
+            END
+        """
+
+        try:
+            conn.execute(f"""
+                CREATE OR REPLACE TABLE {staging} AS
+                SELECT
+                    'building/' || CAST(id AS VARCHAR)              AS feature_id,
+                    'building'                                       AS feature_type,
+
+                    geometry                                         AS geom,
+
+                    ST_Y(ST_Centroid(ST_GeomFromWKB(geometry)))     AS centroid_lat,
+                    ST_X(ST_Centroid(ST_GeomFromWKB(geometry)))     AS centroid_lng,
+
+                    '{config.country}'                               AS country_code,
+
+                    {h3_selects},
+
+                    {z}                                              AS tile_z,
+                    CAST(FLOOR(
+                        ((ST_X(ST_Centroid(ST_GeomFromWKB(geometry))) + 180.0) / 360.0)
+                        * POW(2, {z})
+                    ) AS INTEGER)                                    AS tile_x,
+                    CAST(FLOOR(
+                        (1.0 - LN(
+                            TAN(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(geometry)))))
+                            + 1.0 / COS(RADIANS(ST_Y(ST_Centroid(ST_GeomFromWKB(geometry)))))
+                        ) / PI()) / 2.0 * POW(2, {z})
+                    ) AS INTEGER)                                    AS tile_y,
+
+                    -- OSM semantic fields — not applicable to building rows
+                    NULL::VARCHAR                                    AS highway,
+                    NULL::VARCHAR                                    AS building,
+                    NULL::VARCHAR                                    AS amenity,
+                    NULL::VARCHAR                                    AS landuse,
+                    NULL::INTEGER                                    AS population,
+                    NULL::TINYINT                                    AS road_class,
+
+                    -- Building semantic fields
+                    CAST(floorspace AS VARCHAR)                      AS floorspace,
+                    occupancy                                        AS occupancy,
+                    height                                            AS height_raw,
+                    {height_m_case}                                  AS height_m,
+                    {height_floors_case}                             AS height_floors,
+                    quadkey                                          AS quadkey,
+                    relation_id                                      AS relation_id,
+                    source                                           AS source_provider,
+                    ST_Area(ST_Transform(
+                        ST_GeomFromWKB(geometry), 'EPSG:4326', 'EPSG:{utm_epsg}'
+                    ))                                                AS area_m2,
+                    ST_Perimeter(ST_Transform(
+                        ST_GeomFromWKB(geometry), 'EPSG:4326', 'EPSG:{utm_epsg}'
+                    ))                                                AS perimeter_m
+
+                FROM {source_table}
+                WHERE {where_clause}
+            """)
+
+            self._apply_zorder_key(conn, staging)
+
+            count = conn.execute(f"SELECT COUNT(*) FROM {staging}").fetchone()[0]
+            logger.info(f"Staging complete: {count:,} buildings in {staging}")
+            return staging
+
+        except Exception as e:
+            logger.error(f"Building staging failed for {source_table}: {e}")
+            raise
+
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # Stages 5–9: entropy, buckets, importance, hysteresis
     # These run per H3 cell (res 8) — the canonical entropy anchor.
+    # Identical for OSM and building staging tables, since both now
+    # produce the same superset of columns.
     # ------------------------------------------------------------------
 
     def _compute_entropy_metrics(self, staging: str) -> Dict[str, Dict]:
@@ -510,6 +739,9 @@ class Partitioner:
 
         Pulls the fields needed for I(S) from the staging table.
         Neighbor count approximated via H3 cell feature density.
+        Uses real area_m2 when available (building datasets); falls back
+        to the neutral default (OSM, which has no polygon area computed)
+        the same way the original implementation did.
         Returns dict: {feature_id → importance_byte}
         """
         conn = self._conn()
@@ -533,17 +765,20 @@ class Partitioner:
                     feature_id,
                     building,
                     amenity,
-                    h3_9
+                    h3_9,
+                    area_m2,
+                    occupancy
                 FROM {staging}
             """).fetchall()
 
-            for feature_id, building, amenity, h3_9 in feature_rows:
+            for feature_id, building, amenity, h3_9, area_m2, occupancy in feature_rows:
                 neighbor_count = density.get(h3_9, 1) - 1   # exclude self
                 score = _importance_score(
-                    area=500.0,          # geometry area not in staging; use neutral default
+                    area=area_m2 if area_m2 is not None else 500.0,
                     building_tag=building,
                     amenity_tag=amenity,
                     neighbor_count=max(0, neighbor_count),
+                    occupancy=occupancy,
                 )
                 importance_map[feature_id] = _quantize_importance(score)
 
@@ -585,7 +820,9 @@ class Partitioner:
                 h3_7, h3_8, h3_9, h3_10,
                 tile_z, tile_x, tile_y,
                 zorder_key,
-                highway, building, amenity, landuse, population, road_class
+                highway, building, amenity, landuse, population, road_class,
+                floorspace, occupancy, height_raw, height_m, height_floors,
+                quadkey, relation_id, source_provider, area_m2, perimeter_m
             FROM {staging}
             WHERE tile_z = ? AND tile_x = ? AND tile_y = ?
         """, [tile_z, tile_x, tile_y]).fetchall()
@@ -603,6 +840,8 @@ class Partitioner:
             "importance_byte", "entropy_score",
             "compressed_size_bytes", "partition_run_id",
             "highway", "building", "amenity", "landuse", "population", "road_class",
+            "floorspace", "occupancy", "height_raw", "height_m", "height_floors",
+            "quadkey", "relation_id", "source_provider", "area_m2", "perimeter_m",
         ]}
 
         # Sort rows: entropy_bucket ASC, zorder_key ASC, importance DESC
@@ -621,7 +860,9 @@ class Partitioner:
             (fid, ftype, geom, clat, clng, cc,
              h3_7, h3_8, h3_9, h3_10,
              tz, tx, ty, zk,
-             highway, building, amenity, landuse, pop, rc) = row
+             highway, building, amenity, landuse, pop, rc,
+             floorspace, occupancy, height_raw, height_m, height_floors,
+             quadkey, relation_id, source_provider, area_m2, perimeter_m) = row
 
             m = entropy_metrics.get(h3_8, {
                 "entropy_score":    0.0,
@@ -658,6 +899,16 @@ class Partitioner:
             enriched["landuse"].append(landuse)
             enriched["population"].append(pop)
             enriched["road_class"].append(rc)
+            enriched["floorspace"].append(floorspace)
+            enriched["occupancy"].append(occupancy)
+            enriched["height_raw"].append(height_raw)
+            enriched["height_m"].append(height_m)
+            enriched["height_floors"].append(height_floors)
+            enriched["quadkey"].append(quadkey)
+            enriched["relation_id"].append(relation_id)
+            enriched["source_provider"].append(source_provider)
+            enriched["area_m2"].append(area_m2)
+            enriched["perimeter_m"].append(perimeter_m)
 
         # Write Parquet
         tile_path = output_path / f"z{tile_z}" / str(tile_x) / f"{tile_y}.parquet"
@@ -772,20 +1023,38 @@ class Partitioner:
         Run the full 11-stage pipeline for a registered dataset.
 
         Args:
-            dataset_key:   Key in the dataset registry (e.g. 'canary', 'kenya').
-                           Controls source filtering and output path.
+            dataset_key:   Key in either registry — OSM DataRegistry
+                           (e.g. 'canary', 'kenya') or BuildingRegistry
+                           (e.g. 'kenya-buildings'). Controls source
+                           filtering and output path.
             source_table:  DuckDB table to read from (default: 'osm').
+                           For building datasets this should be the table
+                           name BuildingConfig.materialize_to_duckdb() was
+                           called with (default 'buildings').
 
         Returns:
             Manifest dict (also written to disk as manifest.json)
         """
-        from ..Ingestion.DataRegistry import registry
+        from ..Ingestion.DataRegistry import registry as osm_registry
+        from ..Ingestion.BuildingRegistry import building_registry
 
-        config = registry.get(dataset_key)
+        if dataset_key in osm_registry:
+            config = osm_registry.get(dataset_key)
+            dataset_kind = "osm"
+        elif dataset_key in building_registry:
+            config = building_registry.get(dataset_key)
+            dataset_kind = "buildings"
+        else:
+            raise ValueError(
+                f"Unknown dataset: '{dataset_key}'. "
+                f"OSM datasets: {osm_registry.list()} | "
+                f"Building datasets: {building_registry.list()}"
+            )
+
         country_code = config.country
 
         logger.info(
-            f"Pipeline start — dataset={dataset_key} "
+            f"Pipeline start — dataset={dataset_key} ({dataset_kind}) "
             f"country={country_code} "
             f"filter={config.country_filter or 'none'} "
             f"bbox={config.bbox or 'none'} "
@@ -793,16 +1062,30 @@ class Partitioner:
         )
 
         # Stages 1–4: staging with filter applied from config
-        staging = self._build_staging_table(source_table, config)
+        staging = (
+            self._build_staging_table(source_table, config)
+            if dataset_kind == "osm"
+            else self._build_staging_table_buildings(source_table, config)
+        )
 
         # Stages 5–9: entropy and importance
         entropy_metrics = self._compute_entropy_metrics(staging)
         importance_map  = self._compute_importance_bytes(staging)
 
         # Stage 10: export per tile
-        # Output path: {output_dir}/{country_lower}/
-        # No city subdirectory — partitioner is country-scoped
-        output_path = self.output_dir / country_code.lower()
+        # Output path: {output_dir}/{country_lower}/            (OSM)
+        #              {output_dir}/{country_lower}/buildings/  (buildings)
+        # The 'buildings' subdirectory is mandatory, not cosmetic — an OSM
+        # dataset and a building dataset can share the same country code
+        # (e.g. 'kenya' and 'kenya-buildings' are both country='KE'), and
+        # without this split they would write into the identical tile
+        # paths and silently clobber each other's Parquet files.
+        # No city subdirectory otherwise — partitioner is country-scoped.
+        output_path = (
+            self.output_dir / country_code.lower() / "buildings"
+            if dataset_kind == "buildings"
+            else self.output_dir / country_code.lower()
+        )
         output_path.mkdir(parents=True, exist_ok=True)
 
         conn = self._conn()

@@ -33,7 +33,7 @@ def main():
         uvicorn.run(
             "himap.API.main:app",
             host="0.0.0.0",
-            port=8000,
+            port=9910,
             reload=True,  # Set to False in production
             log_level="info",
             access_log=True

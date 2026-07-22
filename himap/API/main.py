@@ -1,24 +1,26 @@
 """
 HiMap v3.0 — App Factory
- 
+
 This file does three things only:
     1. Create the FastAPI app with middleware and exception handlers
     2. Mount routers (query, partitions, catalog)
     3. Run startup/shutdown lifecycle (build DuckDB views)
- 
+
 No SQL. No business logic. No direct service calls beyond startup.
- 
+
 Architecture:
     main.py
         ↓ mounts
     routes/query.py       — /query/all, /query/h3
     routes/partitions.py  — /partitions/{dataset}/{z}/{x}/{y}.parquet
-    routes/catalog.py     — /health, /datasets
- 
+    routes/catalog.py     — /health, /datasets, /buildings-datasets, /towns
+    routes/RoutesBuidings.py — /buildings/{dataset}, /buildings/{dataset}/stats
+
     All routes delegate to:
-    ViewGenerator         — produces SQL strings (bbox_query, h3_query)
-    DuckLakeService       — executes SQL
-    DatasetRegistry       — resolves dataset keys to config
+    ViewGenerator          — produces SQL strings (bbox_query, h3_query) for OSM
+    BuildingViewGenerator  — builds the 3-tier view set for building datasets
+    DuckLakeService        — executes SQL
+    DatasetRegistry / BuildingRegistry — resolve dataset keys to config
 """
 
 import logging
@@ -33,25 +35,26 @@ from ..Ingestion.DataRegistry import registry
 from ..Ingestion.BuildingRegistry import building_registry
 from ..Towns import town_registry
 from ..Generator.viewGenerator import ViewGenerator
+from ..Generator.Buildingviewgenerator import BuildingViewGenerator
 from ..Models.responses import ErrorDetail, ErrorResponse, APIRootResponse
 from ..Routes.RoutesCatalog import router as catalog_router
 from ..Routes.RoutesPartinitions import router as partitions_router
 from ..Routes.RoutesQuery import router as query_router
 from ..Routes.RoutesBuidings import router as buildings_router
 import logging
- 
- 
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
- 
+
 app = FastAPI(
     title="HiMap Spatial Data API",
     description=(
@@ -62,12 +65,12 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
- 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -75,12 +78,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Exception handlers
 # ---------------------------------------------------------------------------
- 
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     errors = [
@@ -91,7 +94,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         )
         for error in exc.errors()
     ]
- 
+
     field_msgs = [f"{'.'.join(e.loc)}: {e.msg}" for e in errors if e.loc]
     return JSONResponse(
         status_code=422,
@@ -101,8 +104,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             details=errors,
         ).model_dump(),
     )
- 
- 
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
@@ -112,8 +115,8 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             message=exc.detail,
         ).model_dump(),
     )
- 
- 
+
+
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     logger.error(
@@ -128,22 +131,22 @@ async def general_exception_handler(request: Request, exc: Exception):
             details=[ErrorDetail(loc=["server"], msg=str(exc), type=type(exc).__name__)],
         ).model_dump(),
     )
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
- 
+
 app.include_router(catalog_router)
 app.include_router(query_router)
 app.include_router(partitions_router)
 app.include_router(buildings_router)
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Root
 # ---------------------------------------------------------------------------
- 
+
 @app.get("/", response_model=APIRootResponse, tags=["info"], summary="API info")
 async def root():
     return APIRootResponse(
@@ -154,9 +157,14 @@ async def root():
             "GET /datasets/{key}":                           "Dataset config",
             "GET /datasets/{key}/views":                     "DuckDB view state",
             "GET /datasets/{key}/towns":                     "Towns linked to a dataset",
+            "GET /buildings-datasets":                       "List registered building datasets",
+            "GET /buildings-datasets/{key}":                 "Building dataset config",
+            "GET /buildings-datasets/{key}/views":           "DuckDB view state (buildings)",
+            "GET /buildings-datasets/{key}/towns":           "Towns linked to a building dataset",
             "GET /towns":                                    "List all registered towns",
             "GET /towns/{key}":                              "Town config + spatial fields",
             "GET /towns/{key}/bbox-params":                  "Ready-to-use params for /query/all",
+            "GET /towns/{key}/buildings-bbox-params":        "Ready-to-use params for /buildings/{dataset}",
             "GET /towns/{key}/h3-params":                    "Ready-to-use params for /query/h3",
             "GET /buildings/{dataset}?zoom=&sw_lng=...":      "Building footprints (zoom >= 14 only)",
             "GET /buildings/{dataset}/stats?zoom=&sw_lng=...": "Building counts by occupancy type",
@@ -165,12 +173,12 @@ async def root():
             "GET /partitions/{dataset}/manifest":            "Partition manifest",
         },
     )
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
- 
+
 @app.on_event("startup")
 async def startup():
     logger.info("=" * 60)
@@ -179,29 +187,41 @@ async def startup():
     logger.info(f"Registered towns     : {town_registry.list()}")
     logger.info(f"Building datasets    : {building_registry.list()}")
     logger.info("=" * 60)
- 
+
     # Health check
     health = ducklake_service.health_check()
     if health["healthy"]:
         logger.info(f"DuckLake ready — catalog={health['catalog']} latency={health['latency_ms']}ms")
     else:
         logger.warning(f"DuckLake unhealthy at startup: {health.get('error')}")
- 
-    # Build DuckDB views for all registered datasets
+
+    # Build DuckDB views for all registered OSM datasets
     # Views are CREATE OR REPLACE — safe to run on every startup
     vg = ViewGenerator(ducklake_service)
     built = vg.build_all()
-    logger.info(f"Views built for: {built}")
- 
+    logger.info(f"OSM views built for: {built}")
+
+    # Build DuckDB views for all registered building datasets.
+    # Same CREATE OR REPLACE safety as above. Note this only guarantees
+    # the raw {key}_buildings_view tier — the partitioned/enriched tiers
+    # are built here too, but only for datasets that already have
+    # h3_enriched=True at the time this runs. A dataset that gets
+    # partitioned and flipped to h3_enriched=True *after* the app has
+    # started still needs BuildingViewGenerator.build(key) called again
+    # (e.g. from an admin endpoint, or by restarting) — startup alone
+    # doesn't pick up mid-lifetime enrichment.
+    bvg = BuildingViewGenerator(ducklake_service)
+    buildings_built = bvg.build_all()
+    logger.info(f"Building views built for: {buildings_built}")
+
     # Log table inventory
     try:
         tables = ducklake_service.list_tables()
         logger.info(f"Visible tables: {[t['name'] for t in tables]}")
     except Exception as e:
         logger.warning(f"Could not list tables: {e}")
- 
- 
+
+
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("HiMap v3.0 shutting down")
-

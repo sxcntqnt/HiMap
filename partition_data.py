@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Partition OSM data into spatially-organized Parquet files.
+Partition OSM and building data into spatially-organized Parquet files.
 
 Runs the HiMap v3.0 eleven-stage pipeline:
     1.  load_source
@@ -18,24 +18,39 @@ Runs the HiMap v3.0 eleven-stage pipeline:
 Dataset filtering (country, bbox) is driven by the dataset registry.
 No --city argument — the pipeline is country-scoped.
 
+Datasets can come from either registry:
+    - himap.Ingestion.DataRegistry (OSM)      — reads an existing table
+      in --db-path.
+    - himap.Ingestion.BuildingRegistry        — reads raw parquet from
+      each dataset's base_path/S3 location. Since Partitioner expects a
+      DuckDB table to read from (same as OSM), building datasets are
+      first materialized into --db-path as a table before the same,
+      unmodified Partitioner.run_pipeline() call is made. This keeps
+      the 11-stage pipeline dataset-agnostic — the only building-
+      specific step is getting the parquet into a table.
+
 Usage:
     python partition_data.py --db-path ./data/osm.duckdb --dataset canary
     python partition_data.py --db-path ./data/osm.duckdb --dataset kenya
-    python partition_data.py --db-path ./data/africa.duckdb --dataset canary --dry-run
+    python partition_data.py --db-path ./data/buildings.duckdb --dataset kenya-buildings
+    python partition_data.py --db-path ./data/osm.duckdb --dataset canary --dry-run
 
-To add a new dataset, register it in himap/dataset_registry.py first.
+To add a new OSM dataset, register it in himap/dataset_registry.py.
+To add a new building dataset, register it in himap/BuildingRegistry.py.
 """
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
+
+import duckdb
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from himap.Export.Partitioner import Partitioner
 from himap.Ingestion.DataRegistry import registry
+from himap.Ingestion.BuildingRegistry import building_registry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,16 +59,49 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def resolve_dataset(dataset_key: str):
+    """
+    Look up a dataset key in both registries.
+
+    Returns (config, kind) where kind is "osm" or "buildings".
+    Raises ValueError if the key isn't registered anywhere.
+    """
+    if dataset_key in registry:
+        return registry.get(dataset_key), "osm"
+    if dataset_key in building_registry:
+        return building_registry.get(dataset_key), "buildings"
+    raise ValueError(
+        f"Unknown dataset: '{dataset_key}'. "
+        f"OSM datasets: {registry.list()} | "
+        f"Building datasets: {building_registry.list()}"
+    )
+
+
+def materialize_buildings(config, db_path: str, table_name: str) -> int:
+    """
+    Load a building dataset's raw parquet into `table_name` inside the
+    DuckDB file at db_path, so Partitioner can read it exactly like an
+    OSM table. Returns the row count loaded.
+    """
+    conn = duckdb.connect(db_path)
+    try:
+        return config.materialize_to_duckdb(conn, table_name=table_name)
+    finally:
+        conn.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Partition OSM data — HiMap v3.0 pipeline",
+        description="Partition OSM / building data — HiMap v3.0 pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Registered datasets are defined in himap/dataset_registry.py.
+OSM datasets are defined in himap/dataset_registry.py.
+Building datasets are defined in himap/BuildingRegistry.py.
 
 Examples:
     %(prog)s --db-path ./data/osm.duckdb --dataset canary
     %(prog)s --db-path ./data/osm.duckdb --dataset kenya --output ./lake
+    %(prog)s --db-path ./data/buildings.duckdb --dataset kenya-buildings
     %(prog)s --db-path ./data/osm.duckdb --dataset canary --dry-run
         """,
     )
@@ -61,17 +109,24 @@ Examples:
     parser.add_argument(
         "--db-path",
         required=True,
-        help="Path to DuckDB database file containing the osm table",
+        help="Path to DuckDB database file. For OSM datasets this must "
+             "already contain the source table. For building datasets, "
+             "this file will be created/updated with the materialized "
+             "building table before partitioning runs.",
     )
     parser.add_argument(
         "--dataset",
         required=True,
-        help=f"Dataset key from registry. Registered: {registry.list()}",
+        help=(
+            "Dataset key. Looked up in both registries — "
+            f"OSM: {registry.list()} | Buildings: {building_registry.list()}"
+        ),
     )
     parser.add_argument(
         "--table",
-        default="osm",
-        help="Source table in DuckDB (default: osm)",
+        default=None,
+        help="Source table name. Defaults to 'osm' for OSM datasets and "
+             "'buildings' for building datasets.",
     )
     parser.add_argument(
         "--output",
@@ -104,21 +159,20 @@ Examples:
     args = parser.parse_args()
 
     # Validate dataset key early — fail fast before any DB work
-    if args.dataset not in registry:
-        logger.error(
-            f"Unknown dataset: '{args.dataset}'. "
-            f"Registered datasets: {registry.list()}"
-        )
+    try:
+        config, kind = resolve_dataset(args.dataset)
+    except ValueError as e:
+        logger.error(str(e))
         return 1
 
-    config = registry.get(args.dataset)
+    table_name = args.table or ("osm" if kind == "osm" else "buildings")
     h3_resolutions = [int(r.strip()) for r in args.h3_resolutions.split(",")]
 
     logger.info("HiMap Partitioner v3.0")
-    logger.info(f"  Dataset    : {args.dataset}")
+    logger.info(f"  Dataset    : {args.dataset} ({kind})")
     logger.info(f"  Country    : {config.country}")
     logger.info(f"  Filter     : country='{config.country_filter or 'none'}' bbox={config.bbox or 'none'}")
-    logger.info(f"  Source     : {args.db_path} → table '{args.table}'")
+    logger.info(f"  Source     : {args.db_path} → table '{table_name}'")
     logger.info(f"  Output     : {args.output}/{config.country.lower()}/")
     logger.info(f"  Zoom       : {args.zoom}")
     logger.info(f"  H3 res     : {h3_resolutions}")
@@ -128,6 +182,11 @@ Examples:
         return 0
 
     try:
+        if kind == "buildings":
+            logger.info(f"Materializing '{args.dataset}' parquet → {args.db_path}::{table_name}")
+            row_count = materialize_buildings(config, args.db_path, table_name)
+            logger.info(f"Loaded {row_count:,} rows into '{table_name}'")
+
         partitioner = Partitioner(
             db_path=args.db_path,
             output_dir=args.output,
@@ -138,7 +197,7 @@ Examples:
 
         manifest = partitioner.run_pipeline(
             dataset_key=args.dataset,
-            source_table=args.table,
+            source_table=table_name,
         )
 
         # Summary
@@ -166,11 +225,19 @@ Examples:
         # Next steps
         logger.info("")
         logger.info("Next steps:")
-        logger.info(f"  1. Build DuckDB views:")
+        if kind == "buildings":
+            logger.info(
+                f"  1. Flip h3_enriched=True for '{args.dataset}' in "
+                f"BuildingRegistry.py so the routes layer switches to "
+                f"the h3_9 query path."
+            )
+            logger.info(f"  2. Build DuckDB views:")
+        else:
+            logger.info(f"  1. Build DuckDB views:")
         logger.info(f"       from himap.view_generator import ViewGenerator")
         logger.info(f"       vg = ViewGenerator(ducklake_service)")
         logger.info(f"       vg.build('{args.dataset}')")
-        logger.info(f"  2. Upload to storage:")
+        logger.info(f"  {'3' if kind == 'buildings' else '2'}. Upload to storage:")
         logger.info(f"       rclone copy {args.output}/{country} r2:himap-lake/{country}")
 
         return 0

@@ -3,7 +3,7 @@ Building Registry — HiMap v3.0
 
 Separate registry for OpenBuildingMap (OBM) datasets.
 These are distinct from OSM data — different schema, different source,
-different partitioning scheme (quadkey, not H3 yet).
+different partitioning scheme (quadkey, transitioning to H3).
 
 Schema (OpenBuildingMap Parquet):
     id          BIGINT
@@ -15,7 +15,7 @@ Schema (OpenBuildingMap Parquet):
     height      VARCHAR    — 'HBET:1-2', numeric string, or None
     geometry    GEOMETRY   — WKB polygon/multipolygon
     bbox        STRUCT(xmin DOUBLE, ymin DOUBLE, xmax DOUBLE, ymax DOUBLE)
-    source      VARCHAR    — 'OSM'
+    source      VARCHAR    — 'OSM', 'Google', 'Microsoft', etc.
 
 Zoom gate (non-negotiable):
     Buildings are only queryable at zoom >= MIN_BUILDING_ZOOM (14).
@@ -29,7 +29,8 @@ Quadkey filtering (pre-H3):
     quadkey inside that tile.
     WHERE quadkey LIKE 'XXXXXXXXXX%' is a cheap prefix scan that
     replaces ST_Intersects for coarse filtering.
-    After H3 enrichment: WHERE h3_9 = ? will replace this.
+    After H3 enrichment: WHERE h3_9 = ? will replace this — see
+    `h3_enriched` below, which flips the routes layer over to that path.
 
 Occupancy codes:
     UNK — unknown
@@ -46,7 +47,7 @@ Height encoding:
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 # Minimum zoom level for building queries — enforced at API boundary
@@ -83,6 +84,26 @@ class BuildingConfig:
 
     has_height:     Whether height data is available in this partition.
     has_occupancy:  Whether occupancy classification is available.
+
+    country_filter / bbox:
+                    Compatibility fields so this config can be logged and
+                    handled by the same code path as DatasetConfig (OSM)
+                    in partition_data.py. Buildings datasets are already
+                    scoped by `base_path` + `quadkey_prefixes`, so these
+                    are typically left as None — they exist purely so
+                    `main()` doesn't need an isinstance branch just to
+                    print a log line.
+
+    dataset_kind:   Marker used by partition_data.py to decide how to
+                    materialize the source before calling Partitioner.
+                    Always "buildings" for this registry.
+
+    h3_enriched:    Flip this to True once `partition_data.py` has been
+                    run for this dataset key and the enriched, H3-
+                    partitioned output exists. The routes layer reads
+                    this flag to decide whether it can query by
+                    `h3_9 = ?` or must fall back to the pre-H3
+                    bbox/quadkey path.
     """
     country:         str
     base_path:       str
@@ -94,12 +115,48 @@ class BuildingConfig:
     has_height:       bool             = True
     has_occupancy:    bool             = True
 
+    # --- compatibility with the OSM DatasetConfig / Partitioner CLI ---
+    country_filter:   Optional[str]           = None
+    bbox:             Optional[Tuple[float, float, float, float]] = None
+    dataset_kind:     str                     = "buildings"
+    h3_enriched:      bool                    = False
+
+    # UTM EPSG code used by the partitioner to compute true area_m2 /
+    # perimeter_m (ST_Transform target). Pick the zone that covers this
+    # dataset's region — ST_Area on raw WGS84 coordinates gives degrees²,
+    # not meters, so this must be set per dataset rather than assumed.
+    utm_epsg:         int                     = 32637  # UTM 37N — Kenya default
+
     def parquet_glob(self) -> str:
-        """Glob pattern for DuckDB read_parquet()."""
+        """Glob pattern for DuckDB read_parquet() over the RAW source
+        (pre-enrichment OpenBuildingMap parquet at base_path)."""
         return f"{self.base_path.rstrip('/')}/**/*.parquet"
 
+    def enriched_parquet_glob(self, lake_root: Optional[str] = None) -> str:
+        """
+        Glob pattern over the ENRICHED, H3-partitioned output that
+        partition_data.py writes for this dataset.
+
+        Must match Partitioner.run_pipeline's output_path for building
+        datasets: {lake_root}/{country_lower}/buildings/ — nested under
+        a 'buildings' subdirectory specifically so it can never collide
+        with the OSM dataset output at {lake_root}/{country_lower}/,
+        even when both share the same country code.
+        """
+        root = lake_root or os.getenv("HIMAP_LAKE_ROOT", "./lake")
+        return f"{root.rstrip('/')}/{self.country.lower()}/buildings/**/*.parquet"
+
     def view_name(self, key: str) -> str:
+        """Raw pass-through view name (pre-enrichment source)."""
         return f"{key}_buildings_view"
+
+    def partitioned_view_name(self, key: str) -> str:
+        """Pass-through view name over the enriched/partitioned lake output."""
+        return f"{key}_buildings_partitioned"
+
+    def enriched_view_name(self, key: str) -> str:
+        """View name for the enriched tier — partitioned view + derived geometry columns."""
+        return f"{key}_buildings_enriched"
 
     def quadkey_filter_sql(self, quadkey_prefix: Optional[str] = None) -> str:
         """
@@ -118,6 +175,27 @@ class BuildingConfig:
             return "(" + " OR ".join(clauses) + ")"
 
         return "1=1"
+
+    def materialize_to_duckdb(self, conn, table_name: str = "buildings") -> int:
+        """
+        Load this dataset's raw parquet into a table inside an already-open
+        DuckDB connection, so it can be handed to Partitioner exactly the
+        way an OSM `--db-path`/`--table` pair already is.
+
+        This is the entire integration seam with partition_data.py — no
+        changes to Partitioner itself are needed as long as its stages
+        operate generically on `geometry` rather than assuming OSM-only
+        columns.
+
+        Returns the row count loaded, for logging.
+        """
+        glob = self.parquet_glob()
+        conn.execute(f"""
+            CREATE OR REPLACE TABLE {table_name} AS
+            SELECT * FROM read_parquet('{glob}', hive_partitioning=false)
+        """)
+        (count,) = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+        return count
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +276,8 @@ building_registry.register(
         zoom_gate=MIN_BUILDING_ZOOM,
         has_height=True,
         has_occupancy=True,
+        h3_enriched=False,  # flip to True after partition_data.py runs for this key
+        utm_epsg=32637,     # UTM 37N
     )
 )
 
@@ -212,6 +292,8 @@ building_registry.register(
         zoom_gate=MIN_BUILDING_ZOOM,
         has_height=True,
         has_occupancy=True,
+        h3_enriched=False,
+        utm_epsg=32628,     # UTM 28N — covers the Canary Islands
     )
 )
 
